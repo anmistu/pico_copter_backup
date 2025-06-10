@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.13)
 
 include(pico_sdk_import.cmake)
+include_directories(/usr/include/eigen3)
 
 project(pico_copter C CXX ASM)
-set(CMAKE_C_STNDARD 11)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 set(PICO_EXAMPLES_PATH ${PROJECT_SOURCE_DIR})
@@ -26,10 +27,10 @@ target_link_libraries(pico_copter
   hardware_pwm 
   hardware_uart 
   pico_stdlib
-  pico_multicore)
+  pico_multicore
+)
 
 pico_enable_stdio_usb(pico_copter 1)
 pico_enable_stdio_uart(pico_copter 0)
 
 pico_add_extra_outputs(pico_copter)
-
