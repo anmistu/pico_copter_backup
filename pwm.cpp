@@ -8,7 +8,7 @@ uint8_t ESC_calib=0;
 
 //ファイル内グローバル変数
 const uint Slice_num_rear=1;
-const uint Slice_num_front=7;
+const uint Slice_num_front=7;   //スライスの設定変更テイン
 const uint Slice_num_servo = 3;
 
 void pwm_init()
@@ -27,7 +27,7 @@ void pwm_init()
     // Set period T
     // T=(wrap+1)*clkdiv/sysclock
     // T=(24999+1)*100/125e6=25000e2/125e6=200e-4=0.02s(=50Hz)
-    pwm_set_wrap(Slice_num_front, 3749);
+    pwm_set_wrap(Slice_num_front, 3749);    //pico2の設定
     pwm_set_wrap(Slice_num_rear,  3749);
     pwm_set_wrap(Slice_num_servo, 3749);
 
@@ -69,6 +69,7 @@ void pwm_init()
     pwm_set_chan_level(Slice_num_front, PWM_CHAN_A, DUTYMIN);
     pwm_set_chan_level(Slice_num_front, PWM_CHAN_B, DUTYMIN);
     pwm_set_chan_level(Slice_num_rear,  PWM_CHAN_A, DUTYMIN);
+    pwm_set_chan_level(Slice_num_rear,  PWM_CHAN_B, DUTYMIN);
     pwm_set_chan_level(Slice_num_rear,  PWM_CHAN_B, DUTYMIN);
     pwm_set_chan_level(Slice_num_servo, PWM_CHAN_A, 625);
 
