@@ -13,8 +13,8 @@
 
 //#define DUTYMIN 1250
 //#define DUTYMAX 2500
-#define DUTYMIN 1650    //pico2の設定
-#define DUTYMAX 2850    //pico2の設定
+#define DUTYMIN 1375    //pico2の設定
+#define DUTYMAX 2375    //pico2の設定
 
 //グローバル変数
 extern uint8_t ESC_calib;

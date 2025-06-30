@@ -37,7 +37,7 @@ int main(void)
   variable_init();
   control_init();
 
-  ESC_calib=0;    //初回のみ1にしてESCをキャリブレーション
+  ESC_calib=1;    //初回のみ1にしてESCをキャリブレーション
   pwm_init();
 
   while(start_wait)
