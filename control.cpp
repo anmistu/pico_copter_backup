@@ -93,7 +93,7 @@ void loop_400Hz(void)
   S_time=time_us_32();
   
   //割り込みフラグリセット
-  pwm_clear_irq(3);
+  pwm_clear_irq(2);
 
 
   if (Arm_flag==0)
