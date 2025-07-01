@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.13)
+include_directories(/usr/include/eigen3)
+
 
 include(pico_sdk_import.cmake)
-include_directories(/usr/include/eigen3)
 
 project(pico_copter C CXX ASM)
 set(CMAKE_C_STNDARD 11)
