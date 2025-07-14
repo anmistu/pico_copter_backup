@@ -290,14 +290,13 @@ void control_init(void)
 {
   acc_filter.set_parameter(0.005, 0.0025);
   //Rate control
-  p_pid.set_parameter( 1.8, 0.135, 0.075, 0.015, 0.0025);//3.4
-  q_pid.set_parameter( 2.0, 0.09, 0.090, 0.015, 0.0025);//3.8
+  p_pid.set_parameter( 1.8, 0.125, 0.073, 0.015, 0.0025);//3.4
+  q_pid.set_parameter( 2.0, 0.085, 0.085, 0.015, 0.0025);//3.8
   r_pid.set_parameter(12.0, 0.5, 0.008, 0.015, 0.0025);//9.4
   //Angle control
-  phi_pid.set_parameter  ( 5.5, 9.5, 0.025, 0.018, 0.01);//6.0
-  theta_pid.set_parameter( 5.5, 9.5, 0.025, 0.018, 0.01);//6.0
+  phi_pid.set_parameter  ( 5.0, 7.0, 0.013, 0.018, 0.01);//6.0
+  theta_pid.set_parameter( 5.0, 7.0, 0.013, 0.018, 0.01);//6.0
   psi_pid.set_parameter  ( 0.0, 10.0, 0.010, 0.03, 0.01);
-  //Rate control
   //p_pid.set_parameter(3.3656, 0.1, 0.0112, 0.01, 0.0025);
   //q_pid.set_parameter(3.8042, 0.1, 0.0111, 0.01, 0.0025);
   //r_pid.set_parameter(9.4341, 0.11, 0.0056, 0.01, 0.0025);
@@ -401,8 +400,6 @@ void rate_control(void)
   //Motor Control
   // 1250/11.1=112.6
   // 1/11.1=0.0901
-  //3セルの場合の計算
-  //1セルあたり3.7vとする
   
   FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25)*0.0901;
   FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25)*0.0901;
@@ -471,43 +468,73 @@ void rate_control(void)
   //logging();
 }
 
-
 void angle_control(void)
 {
+  float phi_err,theta_err,psi_err;
+  float q0,q1,q2,q3;
+  float e23,e33,e13,e11,e12;
   while(1)
   {
     sem_acquire_blocking(&sem);
     sem_reset(&sem, 0);
-
-    // スティック入力を角速度指令に変換（直接）
-    Pref = 3.0f * (float)(Chdata[3] - (CH4MAX + CH4MIN)*0.5f) * 2.0f / (CH4MAX - CH4MIN);
-    Qref = 3.0f * (float)(Chdata[1] - (CH2MAX + CH2MIN)*0.5f) * 2.0f / (CH2MAX - CH2MIN);
-    Rref = 3.0f * (float)(Chdata[0] - (CH1MAX + CH1MIN)*0.5f) * 2.0f / (CH1MAX - CH1MIN);
-
-    // Logging 用の姿勢情報更新（可視化・ログ保持目的）
+    S_time2=time_us_32();
     kalman_filter();
-    float q0 = Xe(0,0), q1 = Xe(1,0), q2 = Xe(2,0), q3 = Xe(3,0);
-    float e11 = q0*q0 + q1*q1 - q2*q2 - q3*q3;
-    float e12 = 2*(q1*q2 + q0*q3);
-    float e13 = 2*(q1*q3 - q0*q2);
-    float e23 = 2*(q2*q3 + q0*q1);
-    float e33 = q0*q0 - q1*q1 - q2*q2 + q3*q3;
-
-    Phi   = atan2(e23, e33);
+    q0 = Xe(0,0);
+    q1 = Xe(1,0);
+    q2 = Xe(2,0);
+    q3 = Xe(3,0);
+    e11 = q0*q0 + q1*q1 - q2*q2 - q3*q3;
+    e12 = 2*(q1*q2 + q0*q3);
+    e13 = 2*(q1*q3 - q0*q2);
+    e23 = 2*(q2*q3 + q0*q1);
+    e33 = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+    Phi = atan2(e23, e33);
     Theta = atan2(-e13, sqrt(e23*e23+e33*e33));
-    Psi   = atan2(e12, e11);
+    Psi = atan2(e12,e11);
 
-    Phi_ref = 0.0f;
-    Theta_ref = 0.0f;
-    Psi_ref = 0.0f;
+    //Get angle ref 
+    Phi_ref   = Phi_trim   + 0.3 *M_PI*(float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5)*2/(CH4MAX-CH4MIN);
+    Theta_ref = Theta_trim + 0.3 *M_PI*(float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5)*2/(CH2MAX-CH2MIN);
+    Psi_ref   = Psi_trim   + 0.8 *M_PI*(float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5)*2/(CH1MAX-CH1MIN);
 
+    //Error
+    phi_err   = Phi_ref   - (Phi   - Phi_bias);
+    theta_err = Theta_ref - (Theta - Theta_bias);
+    psi_err   = Psi_ref   - (Psi   - Psi_bias);
+    
+    //PID Control
+    if (T_ref/BATTERY_VOLTAGE < Flight_duty)
+    {
+      Pref=0.0;
+      Qref=0.0;
+      Rref=0.0;
+      phi_pid.reset();
+      theta_pid.reset();
+      psi_pid.reset();
+      Aileron_center  = Chdata[3];
+      Elevator_center = Chdata[1];
+      Rudder_center   = Chdata[0];
+      /////////////////////////////////////
+      Phi_bias   = Phi;
+      Theta_bias = Theta;
+      Psi_bias   = Psi;
+      /////////////////////////////////////
+    }
+    else
+    {
+      Pref = phi_pid.update(phi_err);
+      Qref = theta_pid.update(theta_err);
+      Rref = Psi_ref;//psi_pid.update(psi_err);//Yawは角度制御しない
+    }
+
+    //Logging
     logging();
 
-    E_time2 = time_us_32();
-    D_time2 = E_time2 - S_time2;
+    E_time2=time_us_32();
+    D_time2=E_time2-S_time2;
+
   }
 }
-
 
 void logging(void)
 {  
@@ -615,6 +642,7 @@ void log_output(void)
     LogdataCounter=0;
   }
 }
+
 
 void gyroCalibration(void)
 {
