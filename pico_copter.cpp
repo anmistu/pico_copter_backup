@@ -29,7 +29,7 @@ int main(void)
   
   //Initialize PWM
   //Start 400Hz Interval
-  ESC_calib=0;
+  ESC_calib=1;
   pwm_init();
 
   while(start_wait)

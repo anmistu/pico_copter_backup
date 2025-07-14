@@ -93,7 +93,7 @@ void loop_400Hz(void)
   S_time=time_us_32();
   
   //割り込みフラグリセット
-  pwm_clear_irq(2);
+  pwm_clear_irq(3);
 
 
   if (Arm_flag==0)
@@ -290,14 +290,13 @@ void control_init(void)
 {
   acc_filter.set_parameter(0.005, 0.0025);
   //Rate control
-  p_pid.set_parameter( 2.0, 0.145, 0.028, 0.015, 0.0025);//3.4
-  q_pid.set_parameter( 2.1, 0.125, 0.028, 0.015, 0.0025);//3.8
+  p_pid.set_parameter( 1.8, 0.125, 0.073, 0.015, 0.0025);//3.4
+  q_pid.set_parameter( 2.0, 0.085, 0.085, 0.015, 0.0025);//3.8
   r_pid.set_parameter(12.0, 0.5, 0.008, 0.015, 0.0025);//9.4
   //Angle control
-  phi_pid.set_parameter  ( 5.5, 9.5, 0.025, 0.018, 0.01);//6.0
-  theta_pid.set_parameter( 5.5, 9.5, 0.025, 0.018, 0.01);//6.0
+  phi_pid.set_parameter  ( 5.0, 7.0, 0.013, 0.018, 0.01);//6.0
+  theta_pid.set_parameter( 5.0, 7.0, 0.013, 0.018, 0.01);//6.0
   psi_pid.set_parameter  ( 0.0, 10.0, 0.010, 0.03, 0.01);
-  //Rate control
   //p_pid.set_parameter(3.3656, 0.1, 0.0112, 0.01, 0.0025);
   //q_pid.set_parameter(3.8042, 0.1, 0.0111, 0.01, 0.0025);
   //r_pid.set_parameter(9.4341, 0.11, 0.0056, 0.01, 0.0025);
