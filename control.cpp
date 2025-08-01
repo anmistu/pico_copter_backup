@@ -290,12 +290,12 @@ void control_init(void)
 {
   acc_filter.set_parameter(0.005, 0.0025);
   //Rate control
-  p_pid.set_parameter( 1.9, 0.127, 0.090, 0.015, 0.0025);
-  q_pid.set_parameter( 1.8, 0.093, 0.110, 0.015, 0.0025);
+  p_pid.set_parameter( 2.0, 0.15, 0.03, 0.015, 0.0025);
+  q_pid.set_parameter( 2.0, 0.15, 0.03, 0.015, 0.0025);
   r_pid.set_parameter(12.0, 0.5, 0.008, 0.015, 0.0025);//9.4
   //Angle control
-  phi_pid.set_parameter  ( 5.0, 9.5, 0.025, 0.018, 0.01);//6.0
-  theta_pid.set_parameter( 5.0, 9.5, 0.025, 0.018, 0.01);//6.0
+  phi_pid.set_parameter  ( 5.5, 9.5, 0.005, 0.018, 0.01);//6.0
+  theta_pid.set_parameter( 5.5, 9.5, 0.005, 0.018, 0.01);//6.0
   psi_pid.set_parameter  ( 0.0, 10.0, 0.010, 0.03, 0.01);
   //p_pid.set_parameter(3.3656, 0.1, 0.0112, 0.01, 0.0025);
   //q_pid.set_parameter(3.8042, 0.1, 0.0111, 0.01, 0.0025);
