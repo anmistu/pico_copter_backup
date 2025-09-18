@@ -1,66 +1,95 @@
-//control.cpp
+// control.cpp
 //
-//pull request
-
+// preset(CH5)中も姿勢補正(PID)が効くように修正
+// - 平均だけプリセット値に合わせるΔ方式
+// - 実効dutyで安全/角度PIDの判定
+// - ログに最終4輪出力を追加 (DATANUM=44)
+//
+// + ToF(VL53L1X)最小統合（読み取りのみ）
+//   - Core1(angle_control)ループで非ブロッキングpoll
+//   - 共有変数 g_tof_valid / g_tof_mm に最新値を保存
+//   - ログ列の末尾(#45)に ToF[mm] を追加（無効時は -1）
+//   - ToFの初期化(tof_setup)は main 側で実行してください
 
 #include "control.hpp"
+#include "modules/tof/tof_bridge.hpp"  // ★ 追加
 
-//Sensor data
+// Sensor data
 float Ax,Ay,Az,Wp,Wq,Wr,Mx,My,Mz,Mx0,My0,Mz0,Mx_ave,My_ave,Mz_ave;
 float Acc_norm=0.0;
 
-//Times
+// Times
 float Elapsed_time=0.0;
 uint32_t S_time=0,E_time=0,D_time=0,S_time2=0,E_time2=0,D_time2=0;
 
-//Counter
+// Counter
 uint8_t AngleControlCounter=0;
 uint16_t RateControlCounter=0;
 uint16_t BiasCounter=0;
 uint16_t LedBlinkCounter=0;
 
-//Control 
+// Control
 float FR_duty, FL_duty, RR_duty, RL_duty;
 float P_com, Q_com, R_com;
 float T_ref;
 float Pbias=0.0,Qbias=0.0,Rbias=0.0;
-float Phi_bias=0.0,Theta_bias=0.0,Psi_bias=0.0;  
+float Phi_bias=0.0,Theta_bias=0.0,Psi_bias=0.0;
 float Phi,Theta,Psi;
 float Phi_ref=0.0,Theta_ref=0.0,Psi_ref=0.0;
 float Elevator_center=0.0, Aileron_center=0.0, Rudder_center=0.0;
 float Pref=0.0,Qref=0.0,Rref=0.0;
-const float Phi_trim   = 0.01;
-const float Theta_trim = 0.02;
-const float Psi_trim   = 0.0;
+const float Phi_trim   = 0.01f;
+const float Theta_trim = 0.02f;
+const float Psi_trim   = 0.0f;
 
-//Extended Kalman filter 
+// Extended Kalman filter
 Matrix<float, 7 ,1> Xp = MatrixXf::Zero(7,1);
 Matrix<float, 7 ,1> Xe = MatrixXf::Zero(7,1);
 Matrix<float, 6 ,1> Z = MatrixXf::Zero(6,1);
 Matrix<float, 3, 1> Omega_m = MatrixXf::Zero(3, 1);
 Matrix<float, 3, 1> Oomega;
 Matrix<float, 7, 7> P;
-Matrix<float, 6, 6> Q;// = MatrixXf::Identity(3, 3)*0.1;
-Matrix<float, 6, 6> R;// = MatrixXf::Identity(6, 6)*0.0001;
+Matrix<float, 6, 6> Q;
+Matrix<float, 6, 6> R;
 Matrix<float, 7 ,6> G;
 Matrix<float, 3 ,1> Beta;
 
-//Log
+// Log
 uint16_t LogdataCounter=0;
 uint8_t Logflag=0;
 volatile uint8_t Logoutputflag=0;
 float Log_time=0.0;
-const uint8_t DATANUM=38; //Log Data Number
+const uint8_t DATANUM=45;                 // ★ 44 → 45（ToF列を追加）
 const uint32_t LOGDATANUM=48000;
-float Logdata[LOGDATANUM]={0.0};
+float Logdata[LOGDATANUM]={0.0f};
 
-//State Machine
+// === Preset Fixed-Thrust Mode (CH5) ===
+// 平均推力のみを合わせ、姿勢補正(差分)は保持する
+static const float PRESET_DUTY      = 0.33f;                 // 目標平均duty
+static const float PRESET_RAMP_SEC  = 0.30f;                 // ランプ時間[s]
+static const float PRESET_RAMP_STEP = (1.0f/400.0f)/PRESET_RAMP_SEC;
+
+static bool  g_preset_mode = false; // true while CH5 is ON
+static bool  g_ch5_prev     = false; // edge detect
+static float g_cmd_duty     = 0.0f;  // ramp中の目標平均duty
+static float g_out_duty     = 0.0f;  // 出力したdutyの平均（ログ用）
+// 実際にPWMへ出した各輪の最終値（ログ用）
+static float g_out_fr = 0.0f;
+static float g_out_fl = 0.0f;
+static float g_out_rr = 0.0f;
+static float g_out_rl = 0.0f;
+
+// === ToF 共有（他スレッドから読み取りのみ） ===
+static volatile bool     g_tof_valid = false;
+static volatile uint16_t g_tof_mm    = 0;    // [mm]
+
+// State Machine
 uint8_t LockMode=0;
-float Disable_duty =0.10;
-float Flight_duty  =0.18;//0.2/////////////////
+float Disable_duty =0.10f;
+float Flight_duty  =0.18f;
 uint8_t OverG_flag = 0;
 
-//PID object and etc.
+// PID object and etc.
 Filter acc_filter;
 PID p_pid;
 PID q_pid;
@@ -77,46 +106,41 @@ void output_data(void);
 void output_sensor_raw_data(void);
 void kalman_filter(void);
 void logging(void);
+void log_output(void);
 void motor_stop(void);
 uint8_t lock_com(void);
 uint8_t logdata_out_com(void);
 void printPQR(void);
 
-#define AVERAGE 2000
+#define AVERAGE    2000
 #define KALMANWAIT 6000
 
-//Main loop
-//This function is called from PWM Intrupt on 400Hz.
+// Main loop (called from PWM interrupt @400Hz)
 void loop_400Hz(void)
 {
   static uint8_t led=1;
   S_time=time_us_32();
-  
-  //割り込みフラグリセット
-  pwm_clear_irq(3);
 
+  // 割り込みフラグリセット
+  pwm_clear_irq(3);
 
   if (Arm_flag==0)
   {
-      //motor_stop();
-      Elevator_center = 0.0;
-      Aileron_center = 0.0;
-      Rudder_center = 0.0;
-      Pbias = 0.0;
-      Qbias = 0.0;
-      Rbias = 0.0;
-      Phi_bias = 0.0;
-      Theta_bias = 0.0;
-      Psi_bias = 0.0;
-      return;
+    // motor_stop();  // 完全停止は他分岐に委ね
+    Elevator_center = 0.0f;
+    Aileron_center  = 0.0f;
+    Rudder_center   = 0.0f;
+    Pbias = Qbias = Rbias = 0.0f;
+    Phi_bias = Theta_bias = Psi_bias = 0.0f;
+    return;
   }
   else if (Arm_flag==1)
   {
     motor_stop();
-    //Gyro Bias Estimate
+    // Gyro Bias Estimate
     if (BiasCounter < AVERAGE)
     {
-      //Sensor Read
+      // Sensor Read
       sensor_read();
       Aileron_center  += Chdata[3];
       Elevator_center += Chdata[1];
@@ -132,37 +156,29 @@ void loop_400Hz(void)
     }
     else if(BiasCounter<KALMANWAIT)
     {
-      //Sensor Read
       sensor_read();
       if(BiasCounter == AVERAGE)
       {
-        Elevator_center = Elevator_center/AVERAGE;
-        Aileron_center  = Aileron_center/AVERAGE;
-        Rudder_center   = Rudder_center/AVERAGE;
-        Pbias = Pbias/AVERAGE;
-        Qbias = Qbias/AVERAGE;
-        Rbias = Rbias/AVERAGE;
-        Mx_ave = Mx_ave/AVERAGE;
-        My_ave = My_ave/AVERAGE;
-        Mz_ave = Mz_ave/AVERAGE;
+        Elevator_center /= AVERAGE;
+        Aileron_center  /= AVERAGE;
+        Rudder_center   /= AVERAGE;
+        Pbias           /= AVERAGE;
+        Qbias           /= AVERAGE;
+        Rbias           /= AVERAGE;
+        Mx_ave          /= AVERAGE;
+        My_ave          /= AVERAGE;
+        Mz_ave          /= AVERAGE;
 
-        Xe(4,0) = Pbias;
-        Xe(5,0) = Qbias;
-        Xe(6,0) = Rbias;
-        Xp(4,0) = Pbias;
-        Xp(5,0) = Qbias;
-        Xp(6,0) = Rbias;
-        MN = Mx_ave;
-        ME = My_ave;
-        MD = Mz_ave;
+        Xe(4,0) = Pbias; Xp(4,0) = Pbias;
+        Xe(5,0) = Qbias; Xp(5,0) = Qbias;
+        Xe(6,0) = Rbias; Xp(6,0) = Rbias;
+        MN = Mx_ave; ME = My_ave; MD = Mz_ave;
       }
-      
+
       AngleControlCounter++;
-      if(AngleControlCounter==4)
-      {
+      if(AngleControlCounter==4){
         AngleControlCounter=0;
         sem_release(&sem);
-      
       }
       Phi_bias   += Phi;
       Theta_bias += Theta;
@@ -173,9 +189,9 @@ void loop_400Hz(void)
     else
     {
       Arm_flag = 3;
-      Phi_bias   = Phi_bias/KALMANWAIT;
-      Theta_bias = Theta_bias/KALMANWAIT;
-      Psi_bias   = Psi_bias/KALMANWAIT;
+      Phi_bias   = Phi_bias  / KALMANWAIT;
+      Theta_bias = Theta_bias/ KALMANWAIT;
+      Psi_bias   = Psi_bias  / KALMANWAIT;
       return;
     }
   }
@@ -183,14 +199,12 @@ void loop_400Hz(void)
   {
     if(LockMode==2)
     {
-      if(lock_com()==1)
-      {
-        LockMode=3;//Disenable Flight
+      if(lock_com()==1){
+        LockMode=3; // Disable Flight
         led=0;
         gpio_put(LED_PIN,led);
         return;
       }
-      //Goto Flight
     }
     else if(LockMode==3)
     {
@@ -200,24 +214,18 @@ void loop_400Hz(void)
       }
       return;
     }
-    //LED Blink
+
+    // LED Blink
     gpio_put(LED_PIN, led);
-    if(Logflag==1&&LedBlinkCounter<100){
-      LedBlinkCounter++;
-    }
-    else
-    {
-      LedBlinkCounter=0;
-      led=!led;
-    }
-   
-    //Rate Control (400Hz)
+    if(Logflag==1&&LedBlinkCounter<100) LedBlinkCounter++;
+    else { LedBlinkCounter=0; led=!led; }
+
+    // Rate Control (400Hz)
     rate_control();
-   
-    if(AngleControlCounter==4)
-    {
+
+    // Angle Control (100Hz)
+    if(AngleControlCounter==4){
       AngleControlCounter=0;
-      //Angle Control (100Hz)
       sem_release(&sem);
     }
     AngleControlCounter++;
@@ -227,140 +235,90 @@ void loop_400Hz(void)
     motor_stop();
     OverG_flag = 0;
     if(LedBlinkCounter<10){
-      gpio_put(LED_PIN, 1);
-      LedBlinkCounter++;
-    }
-    else if(LedBlinkCounter<100)
-    {
-      gpio_put(LED_PIN, 0);
-      LedBlinkCounter++;
-    }
-    else LedBlinkCounter=0;
-    
-    //Get Stick Center 
+      gpio_put(LED_PIN, 1); LedBlinkCounter++;
+    } else if(LedBlinkCounter<100){
+      gpio_put(LED_PIN, 0); LedBlinkCounter++;
+    } else LedBlinkCounter=0;
+
+    // Get Stick Center
     Aileron_center  = Chdata[3];
     Elevator_center = Chdata[1];
     Rudder_center   = Chdata[0];
-  
-    if(LockMode==0)
-    {
-      if( lock_com()==1)
-      {
-        LockMode=1;
-        return;
-      }
-      //Wait  output log
+
+    if(LockMode==0){
+      if( lock_com()==1 ){ LockMode=1; return; }
     }
-    else if(LockMode==1)
-    {
-      if(lock_com()==0)
-      {
-        LockMode=2;//Enable Flight
-        Arm_flag=2;
-      }
+    else if(LockMode==1){
+      if(lock_com()==0){ LockMode=2; Arm_flag=2; }
       return;
     }
 
-    if(logdata_out_com()==1)
-    {
-      Arm_flag=4;
-      return;
-    }
+    if(logdata_out_com()==1){ Arm_flag=4; return; }
   }
   else if(Arm_flag==4)
   {
     motor_stop();
     Logoutputflag=1;
-    //LED Blink
+    // LED Blink
     gpio_put(LED_PIN, led);
-    if(LedBlinkCounter<400){
-      LedBlinkCounter++;
-    }
-    else
-    {
-      LedBlinkCounter=0;
-      led=!led;
-    }
+    if(LedBlinkCounter<400) LedBlinkCounter++;
+    else { LedBlinkCounter=0; led=!led; }
   }
+
   E_time=time_us_32();
   D_time=E_time-S_time;
 }
 
 void control_init(void)
 {
-  acc_filter.set_parameter(0.005, 0.0025);
-  //Rate control
-  p_pid.set_parameter( 2.0, 0.145, 0.028, 0.015, 0.0025);//3.4
-  q_pid.set_parameter( 2.1, 0.125, 0.028, 0.015, 0.0025);//3.8
-  r_pid.set_parameter(12.0, 0.5, 0.008, 0.015, 0.0025);//9.4
-  //Angle control
-  phi_pid.set_parameter  ( 5.5, 9.5, 0.025, 0.018, 0.01);//6.0
-  theta_pid.set_parameter( 5.5, 9.5, 0.025, 0.018, 0.01);//6.0
-  psi_pid.set_parameter  ( 0.0, 10.0, 0.010, 0.03, 0.01);
-  //Rate control
-  //p_pid.set_parameter(3.3656, 0.1, 0.0112, 0.01, 0.0025);
-  //q_pid.set_parameter(3.8042, 0.1, 0.0111, 0.01, 0.0025);
-  //r_pid.set_parameter(9.4341, 0.11, 0.0056, 0.01, 0.0025);
-  //Angle control
-  //phi_pid.set_parameter  ( 9.0   , 0.07, 0.0352,  0.01, 0.01);
-  //theta_pid.set_parameter( 8.5583, 0.1 , 0.0552,  0.01, 0.01);
-  //psi_pid.set_parameter  ( 9.0256, 0.11, 0.0034,  0.01, 0.01);
+  acc_filter.set_parameter(0.005f, 0.0025f);
+  // Rate control
+  p_pid.set_parameter(  1.7f, 0.15f, 0.020f, 0.015f, 0.0025f);
+  q_pid.set_parameter(  1.7f, 0.15f, 0.020f, 0.015f, 0.0025f);
+  r_pid.set_parameter( 12.0f, 0.50f, 0.008f, 0.015f, 0.0025f);
+  // Angle control
+  phi_pid.set_parameter  ( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
+  theta_pid.set_parameter( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
+  psi_pid.set_parameter  ( 0.0f,10.0f, 0.010f, 0.030f, 0.01f);
 }
 
 uint8_t lock_com(void)
 {
   static uint8_t chatta=0,state=0;
-  if( Chdata[2]<CH3MIN+80 
+  if( Chdata[2]<CH3MIN+80
    && Chdata[0]>CH1MAX-80
-   && Chdata[3]<CH4MIN+80 
+   && Chdata[3]<CH4MIN+80
    && Chdata[1]>CH2MAX-80)
-  { 
-    chatta++;
-    if(chatta>50){
-      chatta=50;
-      state=1;
-    }
-  }
-  else 
   {
-    chatta=0;
-    state=0;
+    chatta++;
+    if(chatta>50){ chatta=50; state=1; }
   }
-
+  else { chatta=0; state=0; }
   return state;
-
 }
 
 uint8_t logdata_out_com(void)
 {
   static uint8_t chatta=0,state=0;
-  if( Chdata[4]<(CH5MAX+CH5MIN)*0.5 
-   && Chdata[2]<CH3MIN+80 
+  if( Chdata[4]<(CH5MAX+CH5MIN)*0.5
+   && Chdata[2]<CH3MIN+80
    && Chdata[0]<CH1MIN+80
-   && Chdata[3]>CH4MAX-80 
+   && Chdata[3]>CH4MAX-80
    && Chdata[1]>CH2MAX-80)
   {
     chatta++;
-    if(chatta>50){
-      chatta=50;
-      state=1;
-    }
+    if(chatta>50){ chatta=50; state=1; }
   }
-  else 
-  {
-    chatta=0;
-    state=0;
-  }
-
+  else { chatta=0; state=0; }
   return state;
 }
 
 void motor_stop(void)
 {
-  set_duty_fr(0.0);
-  set_duty_fl(0.0);
-  set_duty_rr(0.0);
-  set_duty_rl(0.0);
+  set_duty_fr(0.0f);
+  set_duty_fl(0.0f);
+  set_duty_rr(0.0f);
+  set_duty_rl(0.0f);
 }
 
 void rate_control(void)
@@ -369,104 +327,118 @@ void rate_control(void)
   float p_ref, q_ref, r_ref;
   float p_err, q_err, r_err;
 
-  //Read Sensor Value
+  // Read Sensor Value
   sensor_read();
 
-  //Get Bias
-  //Pbias = Xe(4, 0);
-  //Qbias = Xe(5, 0);
-  //Rbias = Xe(6, 0);
-
-  //Control angle velocity
+  // Control angle velocity
   p_rate = Wp - Pbias;
   q_rate = Wq - Qbias;
   r_rate = Wr - Rbias;
 
-  //Get reference
-  p_ref = Pref;
-  q_ref = Qref;
-  r_ref = Rref;
-  T_ref = 0.6 * BATTERY_VOLTAGE*(float)(Chdata[2]-CH3MIN)/(CH3MAX-CH3MIN);
+  // Get reference
+  p_ref = Pref; q_ref = Qref; r_ref = Rref;
 
-  //Error
+  // Throttle base (stick)
+  T_ref = 0.6f * BATTERY_VOLTAGE * (float)(Chdata[2]-CH3MIN)/(CH3MAX-CH3MIN);
+
+  // Error
   p_err = p_ref - p_rate;
   q_err = q_ref - q_rate;
   r_err = r_ref - r_rate;
 
-  //PID
+  // PID
   P_com = p_pid.update(p_err);
   Q_com = q_pid.update(q_err);
   R_com = r_pid.update(r_err);
 
-  //Motor Control
-  // 1250/11.1=112.6
-  // 1/11.1=0.0901
-  
-  FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25)*0.0901;
-  FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25)*0.0901;
-  RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25)*0.0901;
-  RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25)*0.0901;
-  //FR_duty = (T_ref)*0.0901;
-  //FL_duty = (T_ref)*0.0901;
-  //RR_duty = (T_ref)*0.0901;
-  //RL_duty = (T_ref)*0.0901;
-  
-  float minimum_duty=0.1;
-  const float maximum_duty=0.95;
-  minimum_duty = Disable_duty;
+  // Mixer (before clamp)
+  // 1/11.1 ≈ 0.0901
+  FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*0.0901f;
+  FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*0.0901f;
+  RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25f)*0.0901f;
+  RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25f)*0.0901f;
 
-  if (FR_duty < minimum_duty) FR_duty = minimum_duty;
-  if (FR_duty > maximum_duty) FR_duty = maximum_duty;
+  // Clamp
+  const float maximum_duty=0.95f;
+  float minimum_duty = Disable_duty;
+  if (FR_duty < minimum_duty) FR_duty = minimum_duty; if (FR_duty > maximum_duty) FR_duty = maximum_duty;
+  if (FL_duty < minimum_duty) FL_duty = minimum_duty; if (FL_duty > maximum_duty) FL_duty = maximum_duty;
+  if (RR_duty < minimum_duty) RR_duty = minimum_duty; if (RR_duty > maximum_duty) RR_duty = maximum_duty;
+  if (RL_duty < minimum_duty) RL_duty = minimum_duty; if (RL_duty > maximum_duty) RL_duty = maximum_duty;
 
-  if (FL_duty < minimum_duty) FL_duty = minimum_duty;
-  if (FL_duty > maximum_duty) FL_duty = maximum_duty;
+  // === CH5 preset handling (edge detect) ===
+  bool ch5_on       = (Chdata[4] > (CH5MIN + CH5MAX) * 0.5f);
+  bool rising_edge  = ( ch5_on && !g_ch5_prev );
+  bool falling_edge = (!ch5_on &&  g_ch5_prev );
+  g_ch5_prev = ch5_on;
 
-  if (RR_duty < minimum_duty) RR_duty = minimum_duty;
-  if (RR_duty > maximum_duty) RR_duty = maximum_duty;
+  if (rising_edge) {
+    g_preset_mode = true;
+    // 現在の平均出力から滑らかに移行
+    float avg_now = 0.25f*(FR_duty + FL_duty + RR_duty + RL_duty);
+    g_cmd_duty = avg_now;
+  }
+  if (falling_edge) {
+    g_preset_mode = false;
+  }
 
-  if (RL_duty < minimum_duty) RL_duty = minimum_duty;
-  if (RL_duty > maximum_duty) RL_duty = maximum_duty;
+  // Decide target outputs (Δ方式)
+  float out_fr, out_fl, out_rr, out_rl;
+  if (g_preset_mode) {
+    // ramp g_cmd_duty -> PRESET_DUTY
+    float diff = PRESET_DUTY - g_cmd_duty;
+    if      (diff >  PRESET_RAMP_STEP) g_cmd_duty += PRESET_RAMP_STEP;
+    else if (diff < -PRESET_RAMP_STEP) g_cmd_duty -= PRESET_RAMP_STEP;
+    else                               g_cmd_duty  = PRESET_DUTY;
 
-  //Duty set
-  if(T_ref/BATTERY_VOLTAGE < Disable_duty)
-  {
+    const float avg   = 0.25f * (FR_duty + FL_duty + RR_duty + RL_duty);
+    const float delta = g_cmd_duty - avg;
+    out_fr = FR_duty + delta;
+    out_fl = FL_duty + delta;
+    out_rr = RR_duty + delta;
+    out_rl = RL_duty + delta;
+
+    // safety clip
+    const float DUTY_MIN = Disable_duty;
+    const float DUTY_MAX = 0.95f;
+    auto clampf = [&](float v){ return v < DUTY_MIN ? DUTY_MIN : (v > DUTY_MAX ? DUTY_MAX : v); };
+    out_fr = clampf(out_fr);
+    out_fl = clampf(out_fl);
+    out_rr = clampf(out_rr);
+    out_rl = clampf(out_rl);
+  } else {
+    out_fr = FR_duty;
+    out_fl = FL_duty;
+    out_rr = RR_duty;
+    out_rl = RL_duty;
+  }
+
+  // 実効duty（preset時はg_cmd_duty、通常時はT_ref/BATTERY_VOLTAGE）
+  const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
+
+  // Apply safety and send
+  if(eff_duty < Disable_duty) {
     motor_stop();
-    p_pid.reset();
-    q_pid.reset();
-    r_pid.reset();
-    Pref=0.0;
-    Qref=0.0;
-    Rref=0.0;
-    Aileron_center  = Chdata[3];
-    Elevator_center = Chdata[1];
-    Rudder_center   = Chdata[0];
-    Phi_bias   = Phi;
-    Theta_bias = Theta;
-    Psi_bias   = Psi;
-  }
-  else
-  {
+    p_pid.reset(); q_pid.reset(); r_pid.reset();
+    // ログ用にも0を記録
+    g_out_fr = g_out_fl = g_out_rr = g_out_rl = 0.0f;
+    g_out_duty = 0.0f;
+  } else {
     if (OverG_flag==0){
-      set_duty_fr(FR_duty);
-      set_duty_fl(FL_duty);
-      set_duty_rr(RR_duty);
-      set_duty_rl(RL_duty);
+      // 実際に出した値を記録 → PWM
+      g_out_fr = out_fr; g_out_fl = out_fl;
+      g_out_rr = out_rr; g_out_rl = out_rl;
+      set_duty_fr(out_fr);
+      set_duty_fl(out_fl);
+      set_duty_rr(out_rr);
+      set_duty_rl(out_rl);
+      g_out_duty = 0.25f*(out_fr+out_fl+out_rr+out_rl);
+    } else {
+      motor_stop();
+      g_out_fr = g_out_fl = g_out_rr = g_out_rl = 0.0f;
+      g_out_duty = 0.0f;
     }
-    else motor_stop();
-    //printf("%12.5f %12.5f %12.5f %12.5f\n",FR_duty, FL_duty, RR_duty, RL_duty);
   }
- 
-  //printf("\n");
-
-  //printf("%12.5f %12.5f %12.5f %12.5f %12.5f %12.5f %12.5f %12.5f\n", 
-  //    Elapsed_time, fr_duty, fl_duty, rr_duty, rl_duty, p_rate, q_rate, r_rate);
-  //printf("%12.5f %12.5f %12.5f %12.5f %12.5f %12.5f %12.5f\n", 
-  //    Elapsed_time, p_com, q_com, r_com, p_ref, q_ref, r_ref);
-  //printf("%12.5f %12.5f %12.5f %12.5f %12.5f %12.5f %12.5f\n", 
-  //    Elapsed_time, Phi, Theta, Psi, Phi_bias, Theta_bias, Psi_bias);
-  //Elapsed_time = Elapsed_time + 0.0025;
-  //Logging
-  //logging();
 }
 
 void angle_control(void)
@@ -479,86 +451,88 @@ void angle_control(void)
     sem_acquire_blocking(&sem);
     sem_reset(&sem, 0);
     S_time2=time_us_32();
+
     kalman_filter();
-    q0 = Xe(0,0);
-    q1 = Xe(1,0);
-    q2 = Xe(2,0);
-    q3 = Xe(3,0);
+
+    q0 = Xe(0,0); q1 = Xe(1,0); q2 = Xe(2,0); q3 = Xe(3,0);
     e11 = q0*q0 + q1*q1 - q2*q2 - q3*q3;
     e12 = 2*(q1*q2 + q0*q3);
     e13 = 2*(q1*q3 - q0*q2);
     e23 = 2*(q2*q3 + q0*q1);
     e33 = q0*q0 - q1*q1 - q2*q2 + q3*q3;
-    Phi = atan2(e23, e33);
+    Phi   = atan2(e23, e33);
     Theta = atan2(-e13, sqrt(e23*e23+e33*e33));
-    Psi = atan2(e12,e11);
+    Psi   = atan2(e12,e11);
 
-    //Get angle ref 
-    Phi_ref   = Phi_trim   + 0.3 *M_PI*(float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5)*2/(CH4MAX-CH4MIN);
-    Theta_ref = Theta_trim + 0.3 *M_PI*(float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5)*2/(CH2MAX-CH2MIN);
-    Psi_ref   = Psi_trim   + 0.8 *M_PI*(float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5)*2/(CH1MAX-CH1MIN);
+    // Get angle ref (スティック参照 + トリム)
+    Phi_ref   = Phi_trim   + 0.3f*M_PI*(float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f)*2.0f/(CH4MAX-CH4MIN);
+    Theta_ref = Theta_trim + 0.3f*M_PI*(float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f)*2.0f/(CH2MAX-CH2MIN);
+    Psi_ref   = Psi_trim   + 0.8f*M_PI*(float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f)*2.0f/(CH1MAX-CH1MIN);
 
-    //Error
+    // Error
     phi_err   = Phi_ref   - (Phi   - Phi_bias);
     theta_err = Theta_ref - (Theta - Theta_bias);
     psi_err   = Psi_ref   - (Psi   - Psi_bias);
-    
-    //PID Control
-    if (T_ref/BATTERY_VOLTAGE < Flight_duty)
+
+    // 実効duty（rate_control と同定義）
+    const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
+
+    // 角度PIDの有効/リセットを実効dutyで判定
+    if (eff_duty < Flight_duty)
     {
-      Pref=0.0;
-      Qref=0.0;
-      Rref=0.0;
-      phi_pid.reset();
-      theta_pid.reset();
-      psi_pid.reset();
+      Pref=Qref=Rref=0.0f;
+      phi_pid.reset(); theta_pid.reset(); psi_pid.reset();
+
+      // センタ取得＆バイアス更新
       Aileron_center  = Chdata[3];
       Elevator_center = Chdata[1];
       Rudder_center   = Chdata[0];
-      /////////////////////////////////////
       Phi_bias   = Phi;
       Theta_bias = Theta;
       Psi_bias   = Psi;
-      /////////////////////////////////////
     }
     else
     {
-      Pref = phi_pid.update(phi_err);
+      Pref =  phi_pid.update(phi_err);
       Qref = theta_pid.update(theta_err);
-      Rref = Psi_ref;//psi_pid.update(psi_err);//Yawは角度制御しない
+      Rref = Psi_ref; // Yaw角度制御しない設計のまま
     }
 
-    //Logging
+    // ===== ToF poll（非ISR / 非ブロッキング） =====
+    {
+      uint16_t z;
+      tof_poll();
+      bool ok = tof_read_valid(&z);
+      if (ok) { g_tof_valid = true; g_tof_mm = z; }
+      else    { g_tof_valid = false; }
+    }
+
+    // Logging
     logging();
 
     E_time2=time_us_32();
     D_time2=E_time2-S_time2;
-
   }
 }
 
 void logging(void)
-{  
-  //Logging
-  if(Chdata[4]>(CH5MAX+CH5MIN)*0.5)
-  { 
-    if(Logflag==0)
-    {
-      Logflag=1;
-      LogdataCounter=0;
-    }
+{
+  // CH5スイッチでログON（現行仕様）
+  if(Chdata[4]>(CH5MAX+CH5MIN)*0.5f)
+  {
+    if(Logflag==0){ Logflag=1; LogdataCounter=0; }
     if(LogdataCounter+DATANUM<LOGDATANUM)
     {
-      Logdata[LogdataCounter++]=Xe(0,0);                  //1
-      Logdata[LogdataCounter++]=Xe(1,0);                  //2
-      Logdata[LogdataCounter++]=Xe(2,0);                  //3
-      Logdata[LogdataCounter++]=Xe(3,0);                  //4
-      Logdata[LogdataCounter++]=Xe(4,0);                  //5
-      Logdata[LogdataCounter++]=Xe(5,0);                  //6
-      Logdata[LogdataCounter++]=Xe(6,0);                  //7
-      Logdata[LogdataCounter++]=Wp;//-Pbias;              //8
-      Logdata[LogdataCounter++]=Wq;//-Qbias;              //9
-      Logdata[LogdataCounter++]=Wr;//-Rbias;              //10
+      Logdata[LogdataCounter++]=Xe(0,0);                  // 1
+      Logdata[LogdataCounter++]=Xe(1,0);                  // 2
+      Logdata[LogdataCounter++]=Xe(2,0);                  // 3
+      Logdata[LogdataCounter++]=Xe(3,0);                  // 4
+      Logdata[LogdataCounter++]=Xe(4,0);                  // 5
+      Logdata[LogdataCounter++]=Xe(5,0);                  // 6
+      Logdata[LogdataCounter++]=Xe(6,0);                  // 7
+      Logdata[LogdataCounter++]=Wp;                       // 8
+      Logdata[LogdataCounter++]=Wq;                       // 9
+      Logdata[LogdataCounter++]=Wr;                       //10
 
       Logdata[LogdataCounter++]=Ax;                       //11
       Logdata[LogdataCounter++]=Ay;                       //12
@@ -579,30 +553,35 @@ void logging(void)
       Logdata[LogdataCounter++]=P_com;                    //26
       Logdata[LogdataCounter++]=Q_com;                    //27
       Logdata[LogdataCounter++]=R_com;                    //28
-      Logdata[LogdataCounter++]=p_pid.m_integral;//m_filter_output;    //29
-      Logdata[LogdataCounter++]=q_pid.m_integral;//m_filter_output;    //30
+      Logdata[LogdataCounter++]=p_pid.m_integral;         //29
+      Logdata[LogdataCounter++]=q_pid.m_integral;         //30
 
-      Logdata[LogdataCounter++]=r_pid.m_integral;//m_filter_output;    //31
-      Logdata[LogdataCounter++]=phi_pid.m_integral;//m_filter_output;  //32
-      Logdata[LogdataCounter++]=theta_pid.m_integral;//m_filter_output;//33
+      Logdata[LogdataCounter++]=r_pid.m_integral;         //31
+      Logdata[LogdataCounter++]=phi_pid.m_integral;       //32
+      Logdata[LogdataCounter++]=theta_pid.m_integral;     //33
       Logdata[LogdataCounter++]=Pbias;                    //34
       Logdata[LogdataCounter++]=Qbias;                    //35
 
       Logdata[LogdataCounter++]=Rbias;                    //36
       Logdata[LogdataCounter++]=T_ref;                    //37
       Logdata[LogdataCounter++]=Acc_norm;                 //38
+      Logdata[LogdataCounter++]=(g_preset_mode ? 1.0f : 0.0f); //39
+      Logdata[LogdataCounter++]=g_out_duty;               //40
 
-   
+      // 最終PWM出力の各輪（実際に出した値）
+      Logdata[LogdataCounter++]=g_out_fr;                 //41
+      Logdata[LogdataCounter++]=g_out_fl;                 //42
+      Logdata[LogdataCounter++]=g_out_rr;                 //43
+      Logdata[LogdataCounter++]=g_out_rl;                 //44
+
+      // ★ ToF距離[mm]（無効時は -1）
+      Logdata[LogdataCounter++]= g_tof_valid ? (float)g_tof_mm : -1.0f; //45
     }
     else Logflag=2;
   }
   else
-  { 
-    if(Logflag>0)
-    {
-      Logflag=0;
-      LogdataCounter=0;
-    }
+  {
+    if(Logflag>0){ Logflag=0; LogdataCounter=0; }
   }
 }
 
@@ -611,55 +590,42 @@ void log_output(void)
   if(LogdataCounter==0)
   {
     printPQR();
-    printf("#Roll rate PID gain\n");
-    p_pid.printGain();
-    printf("#Pitch rate PID gain\n");
-    q_pid.printGain();
-    printf("#Yaw rate PID gain\n");
-    r_pid.printGain();
-    printf("#Roll angle PID gain\n");
-    phi_pid.printGain();
-    printf("#Pitch angle PID gain\n");
-    theta_pid.printGain();
+    printf("#Roll rate PID gain\n");  p_pid.printGain();
+    printf("#Pitch rate PID gain\n"); q_pid.printGain();
+    printf("#Yaw rate PID gain\n");   r_pid.printGain();
+    printf("#Roll angle PID gain\n"); phi_pid.printGain();
+    printf("#Pitch angle PID gain\n");theta_pid.printGain();
   }
   if(LogdataCounter+DATANUM<LOGDATANUM)
   {
-    //LockMode=0;
     printf("%10.2f ", Log_time);
-    Log_time=Log_time + 0.01;
-    for (uint8_t i=0;i<DATANUM;i++)
-    {
+    Log_time += 0.01f;
+    for (uint8_t i=0;i<DATANUM;i++){
       printf("%12.5f",Logdata[LogdataCounter+i]);
     }
     printf("\n");
-    LogdataCounter=LogdataCounter + DATANUM;
+    LogdataCounter += DATANUM;
   }
-  else 
+  else
   {
     Arm_flag=3;
     Logoutputflag=0;
     LockMode=0;
-    Log_time=0.0;
+    Log_time=0.0f;
     LogdataCounter=0;
   }
 }
 
-
 void gyroCalibration(void)
 {
-  float wp,wq,wr;
-  float sump,sumq,sumr;
+  float sump=0.0f,sumq=0.0f,sumr=0.0f;
   uint16_t N=400;
   for(uint16_t i=0;i<N;i++)
   {
     sensor_read();
-    sump=sump+Wp;
-    sumq=sumq+Wq;
-    sumr=sumr+Wr;
+    sump+=Wp; sumq+=Wq; sumr+=Wr;
   }
-  Pbias=sump/N;
-  Qbias=sumq/N;
-  Rbias=sumr/N;
+  Pbias=sump/N; Qbias=sumq/N; Rbias=sumr/N;
 }
 
 void sensor_read(void)
@@ -667,144 +633,104 @@ void sensor_read(void)
   float mx1, my1, mz1, mag_norm, acc_norm, rate_norm;
 
   imu_mag_data_read();
-  Ax =-acceleration_mg[0]*GRAV*0.001;
-  Ay =-acceleration_mg[1]*GRAV*0.001;
-  Az = acceleration_mg[2]*GRAV*0.001;
-  Wp = angular_rate_mdps[0]*M_PI*5.55555555e-6;//5.5.....e-6=1/180/1000
-  Wq = angular_rate_mdps[1]*M_PI*5.55555555e-6;
-  Wr =-angular_rate_mdps[2]*M_PI*5.55555555e-6;
+  Ax =-acceleration_mg[0]*GRAV*0.001f;
+  Ay =-acceleration_mg[1]*GRAV*0.001f;
+  Az = acceleration_mg[2]*GRAV*0.001f;
+  Wp = angular_rate_mdps[0]*M_PI*5.55555555e-6f;
+  Wq = angular_rate_mdps[1]*M_PI*5.55555555e-6f;
+  Wr =-angular_rate_mdps[2]*M_PI*5.55555555e-6f;
   Mx0 =-magnetic_field_mgauss[0];
   My0 = magnetic_field_mgauss[1];
   Mz0 =-magnetic_field_mgauss[2];
 
-  
-  acc_norm = sqrt(Ax*Ax + Ay*Ay + Az*Az);
-  if (acc_norm>250.0) OverG_flag = 1;
+  acc_norm = sqrtf(Ax*Ax + Ay*Ay + Az*Az);
+  if (acc_norm>250.0f) OverG_flag = 1;
   Acc_norm = acc_filter.update(acc_norm);
-  rate_norm = sqrt(Wp*Wp + Wq*Wq + Wr*Wr);
-  if (rate_norm > 6.0) OverG_flag =1;
+  rate_norm = sqrtf(Wp*Wp + Wq*Wq + Wr*Wr);
+  if (rate_norm > 6.0f) OverG_flag = 1;
 
-/*地磁気校正データ
-回転行列
-[[ 0.65330968  0.75327755 -0.07589064]
- [-0.75666134  0.65302622 -0.03194321]
- [ 0.02549647  0.07829232  0.99660436]]
-中心座標
-122.37559195017053 149.0184454603531 -138.99116060635413
-W
--2.432054387460946
-拡大係数
-0.003077277151877191 0.0031893151610213463 0.0033832794976645804
+  // 地磁気キャリブレーション（あなたの係数をそのまま使用）
+  const float rot[9]={-0.78435472f, -0.62015392f, -0.01402787f,
+                       0.61753358f, -0.78277935f,  0.07686857f,
+                      -0.05865107f,  0.05162955f,  0.99694255f};
+  const float center[3]={-109.32529343620176f, 72.76584808916506f, 759.2285249891385f};
+  const float zoom[3]={0.002034773458122364f, 0.002173892202021849f, 0.0021819494099235273f};
 
-//回転行列
-const float rot[9]={0.65330968, 0.75327755, -0.07589064,
-                   -0.75666134, 0.65302622, -0.03194321,
-                    0.02549647, 0.07829232,  0.99660436};
-//中心座標
-const float center[3]={122.37559195017053, 149.0184454603531, -138.99116060635413};
-//拡大係数
-const float zoom[3]={0.003077277151877191, 0.0031893151610213463, 0.0033832794976645804};
-*/
-  //回転行列
-  const float rot[9]={-0.78435472, -0.62015392, -0.01402787,
-                       0.61753358, -0.78277935,  0.07686857,
-                      -0.05865107,  0.05162955,  0.99694255};
-  //中心座標
-  const float center[3]={-109.32529343620176, 72.76584808916506, 759.2285249891385};
-  //拡大係数
-  const float zoom[3]={0.002034773458122364, 0.002173892202021849, 0.0021819494099235273};
-
-//回転・平行移動・拡大
+  // 回転・平行移動・拡大
   mx1 = zoom[0]*( rot[0]*Mx0 +rot[1]*My0 +rot[2]*Mz0 -center[0]);
   my1 = zoom[1]*( rot[3]*Mx0 +rot[4]*My0 +rot[5]*Mz0 -center[1]);
   mz1 = zoom[2]*( rot[6]*Mx0 +rot[7]*My0 +rot[8]*Mz0 -center[2]);
-//逆回転
+  // 逆回転
   Mx = rot[0]*mx1 +rot[3]*my1 +rot[6]*mz1;
   My = rot[1]*mx1 +rot[4]*my1 +rot[7]*mz1;
-  Mz = rot[2]*mx1 +rot[5]*my1 +rot[8]*mz1; 
+  Mz = rot[2]*mx1 +rot[5]*my1 +rot[8]*mz1;
 
-  mag_norm=sqrt(Mx*Mx +My*My +Mz*Mz);
-  Mx/=mag_norm;
-  My/=mag_norm;
-  Mz/=mag_norm;
+  mag_norm=sqrtf(Mx*Mx +My*My +Mz*Mz);
+  Mx/=mag_norm; My/=mag_norm; Mz/=mag_norm;
 }
 
 void variable_init(void)
 {
-  //Variable Initalize
-  Xe << 1.00, 0.0, 0.0, 0.0,0.0,0.0, 0.0;
+  // Variable Initialize
+  Xe << 1.00f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f;
   Xp =Xe;
 
-  Q <<  6.0e-5, 0.0    , 0.0    ,  0.0    , 0.0    , 0.0   ,
-        0.0   , 5.0e-5 , 0.0    ,  0.0    , 0.0    , 0.0   ,
-        0.0   , 0.0    , 2.8e-5 ,  0.0    , 0.0    , 0.0   ,
-        0.0   , 0.0    , 0.0    ,  5.0e-5 , 0.0    , 0.0   ,
-        0.0   , 0.0    , 0.0    ,  0.0    , 5.0e-5 , 0.0   ,
-        0.0   , 0.0    , 0.0    ,  0.0    , 0.0    , 5.0e-5;
+  Q <<  6.0e-5f, 0.0f   , 0.0f   , 0.0f   , 0.0f   , 0.0f,
+        0.0f   , 5.0e-5f, 0.0f   , 0.0f   , 0.0f   , 0.0f,
+        0.0f   , 0.0f   , 2.8e-5f, 0.0f   , 0.0f   , 0.0f,
+        0.0f   , 0.0f   , 0.0f   , 5.0e-5f, 0.0f   , 0.0f,
+        0.0f   , 0.0f   , 0.0f   , 0.0f   , 5.0e-5f, 0.0f,
+        0.0f   , 0.0f   , 0.0f   , 0.0f   , 0.0f   , 5.0e-5f;
 
-  R <<  1.701e0, 0.0     , 0.0     , 0.0   , 0.0   , 0.0   ,
-        0.0     , 2.799e0, 0.0     , 0.0   , 0.0   , 0.0   ,
-        0.0     , 0.0     , 1.056e0, 0.0   , 0.0   , 0.0   ,
-        0.0     , 0.0     , 0.0     , 2.3e-1, 0.0   , 0.0   ,
-        0.0     , 0.0     , 0.0     , 0.0   , 1.4e-1, 0.0   ,
-        0.0     , 0.0     , 0.0     , 0.0   , 0.0   , 0.49e-1;
-          
-  G <<   1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 
-        -1.0, 1.0,-1.0, 0.0, 0.0, 0.0, 
-        -1.0,-1.0, 1.0, 0.0, 0.0, 0.0, 
-         1.0,-1.0,-1.0, 0.0, 0.0, 0.0, 
-         0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 
-         0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 
-         0.0, 0.0, 0.0, 0.0, 0.0, 1.0;
-  
-  G=G*0.01;
+  R <<  1.701e0f, 0.0f     , 0.0f     , 0.0f , 0.0f , 0.0f,
+        0.0f    , 2.799e0f , 0.0f     , 0.0f , 0.0f , 0.0f,
+        0.0f    , 0.0f     , 1.056e0f , 0.0f , 0.0f , 0.0f,
+        0.0f    , 0.0f     , 0.0f     , 2.3e-1f, 0.0f, 0.0f,
+        0.0f    , 0.0f     , 0.0f     , 0.0f , 1.4e-1f, 0.0f,
+        0.0f    , 0.0f     , 0.0f     , 0.0f , 0.0f , 0.49e-1f;
 
-  Beta << 0.0, 0.0, 0.0;
-  
-  P <<  1e0,  0,   0,   0,   0,  0,   0,  
-        0  ,1e0,   0,   0,   0,  0,   0,
-        0  ,  0, 1e0,   0,   0,  0,   0,  
-        0  ,  0,   0, 1e0,   0,  0,   0, 
-        0  ,  0,   0, 0  , 1e0,  0,   0,  
-        0  ,  0,   0, 0  ,   0,1e0,   0,  
-        0  ,  0,   0, 0  ,   0,  0, 1e0;
+  G <<   1.0f,  1.0f,  1.0f, 0.0f, 0.0f, 0.0f,
+        -1.0f,  1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+        -1.0f, -1.0f,  1.0f, 0.0f, 0.0f, 0.0f,
+         1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+         0.0f,  0.0f,  0.0f, 1.0f, 0.0f, 0.0f,
+         0.0f,  0.0f,  0.0f, 0.0f, 1.0f, 0.0f,
+         0.0f,  0.0f,  0.0f, 0.0f, 0.0f, 1.0f;
+
+  G = G*0.01f;
+  Beta << 0.0f, 0.0f, 0.0f;
+
+  P <<   1e0f, 0, 0, 0, 0, 0, 0,
+          0  , 1e0f,0, 0, 0, 0, 0,
+          0  , 0, 1e0f,0, 0, 0, 0,
+          0  , 0, 0, 1e0f,0, 0, 0,
+          0  , 0, 0, 0, 1e0f,0, 0,
+          0  , 0, 0, 0, 0, 1e0f,0,
+          0  , 0, 0, 0, 0, 0, 1e0f;
 }
 
 void printPQR(void)
 {
-  volatile int m=0;
-  volatile int n=0;
-  //Print P
+  volatile int m=0, n=0;
+  // Print P
   printf("#P\n");
-  for (m=0;m<7;m++)
-  {
+  for (m=0;m<7;m++){
     printf("# ");
-    for (n=0;n<7;n++)
-    {
-      printf("%12.4e ",P(m,n));
-    }
+    for (n=0;n<7;n++) printf("%12.4e ",P(m,n));
     printf("\n");
   }
-  //Print Q
+  // Print Q
   printf("#Q\n");
-  for (m=0;m<6;m++)
-  {
+  for (m=0;m<6;m++){
     printf("# ");
-    for (n=0;n<6;n++)
-    {
-      printf("%12.4e ",Q(m,n));
-    }
+    for (n=0;n<6;n++) printf("%12.4e ",Q(m,n));
     printf("\n");
   }
-  //Print R
+  // Print R
   printf("#R\n");
-  for (m=0;m<6;m++)
-  {
+  for (m=0;m<6;m++){
     printf("# ");
-    for (n=0;n<6;n++)
-    {
-      printf("%12.4e ",R(m,n));
-    }
+    for (n=0;n<6;n++) printf("%12.4e ",R(m,n));
     printf("\n");
   }
 }
@@ -818,126 +744,97 @@ void output_data(void)
          "%13.8f,%13.8f,%13.8f,"
          "%13.8f,%13.8f,%13.8f,"
          "%13.8f,%13.8f,%13.8f"
-         //"%13.8f"
-         "\n"
-            ,Elapsed_time//1
-            ,Xe(0,0), Xe(1,0), Xe(2,0), Xe(3,0)//2~5 
-            ,Xe(4,0), Xe(5,0), Xe(6,0)//6~8
-            //,Phi-Phi_bias, Theta-Theta_bias, Psi-Psi_bias//6~8
-            ,D_time, D_time2//10,11
-            ,Ax, Ay, Az//11~13
-            ,Wp, Wq, Wr//14~16
-            ,Mx, My, Mz//17~19
-            //,mag_norm
-        ); //20
+         "\n",
+         Elapsed_time,
+         Xe(0,0), Xe(1,0), Xe(2,0), Xe(3,0),
+         Xe(4,0), Xe(5,0), Xe(6,0),
+         D_time, D_time2,
+         Ax, Ay, Az,
+         Wp, Wq, Wr,
+         Mx, My, Mz);
 }
+
 void output_sensor_raw_data(void)
 {
   printf("%9.3f,"
          "%13.5f,%13.5f,%13.5f,"
          "%13.5f,%13.5f,%13.5f,"
          "%13.5f,%13.5f,%13.5f"
-         "\n"
-            ,Elapsed_time//1
-            ,Ax, Ay, Az//2~4
-            ,Wp, Wq, Wr//5~7
-            ,Mx, My, Mz//8~10
-        ); //20
+         "\n",
+         Elapsed_time,
+         Ax, Ay, Az,
+         Wp, Wq, Wr,
+         Mx, My, Mz);
 }
 
 void kalman_filter(void)
 {
-  //Kalman Filter
-  float dt=0.01;
+  // Kalman Filter
+  float dt=0.01f;
   Omega_m << Wp, Wq, Wr;
   Z << Ax, Ay, Az, Mx, My, Mz;
   ekf(Xp, Xe, P, Z, Omega_m, Q, R, G*dt, Beta, dt);
 }
 
-
+// ===== PID =====
 PID::PID()
 {
-  m_kp=1.0e-8;
-  m_ti=1.0e8;
-  m_td=0.0;
-  m_integral=0.0;
-  m_filter_time_constant=0.01;
-  m_filter_output=0.0;
-  m_err=0.0;
-  m_h=0.01;
+  m_kp=1.0e-8f;
+  m_ti=1.0e8f;
+  m_td=0.0f;
+  m_integral=0.0f;
+  m_filter_time_constant=0.01f;
+  m_filter_output=0.0f;
+  m_err=0.0f;
+  m_h=0.01f;
 }
 
-void PID::set_parameter(
-    float kp, 
-    float ti, 
-    float td,
-    float filter_time_constant, 
-    float h)
+void PID::set_parameter(float kp, float ti, float td, float filter_time_constant, float h)
 {
-  m_kp=kp;
-  m_ti=ti;
-  m_td=td;
-  m_filter_time_constant=filter_time_constant;
-  m_h=h;
+  m_kp=kp; m_ti=ti; m_td=td; m_filter_time_constant=filter_time_constant; m_h=h;
 }
 
 void PID::reset(void)
 {
-  m_integral=0.0;
-  m_filter_output=0.0;
-  m_err=0.0;
-  m_err2=0.0;
-  m_err3=0.0;
+  m_integral=0.0f;
+  m_filter_output=0.0f;
+  m_err=0.0f;
+  m_err2=0.0f;
+  m_err3=0.0f;
 }
 
-void PID::i_reset(void)
-{
-  m_integral=0.0;
-}
+void PID::i_reset(void){ m_integral=0.0f; }
+
 void PID::printGain(void)
 {
-  printf("#Kp:%8.4f Ti:%8.4f Td:%8.4f Filter T:%8.4f h:%8.4f\n",m_kp,m_ti,m_td,m_filter_time_constant,m_h);
+  printf("#Kp:%8.4f Ti:%8.4f Td:%8.4f Filter T:%8.4f h:%8.4f\n",
+         m_kp,m_ti,m_td,m_filter_time_constant,m_h);
 }
 
 float PID::filter(float x)
 {
-  m_filter_output = m_filter_output * m_filter_time_constant/(m_filter_time_constant + m_h) 
-                  + x * m_h/(m_filter_time_constant + m_h);   
+  m_filter_output = m_filter_output * m_filter_time_constant/(m_filter_time_constant + m_h)
+                  + x * m_h/(m_filter_time_constant + m_h);
   return m_filter_output;
 }
 
 float PID::update(float err)
 {
-  float d;
-  m_integral = m_integral + m_h * err;
-  if(m_integral> 30000.0)m_integral = 30000.0;
-  if(m_integral<-30000.0)m_integral =-30000.0;
+  m_integral += m_h * err;
+  if(m_integral> 30000.0f) m_integral = 30000.0f;
+  if(m_integral<-30000.0f) m_integral =-30000.0f;
   m_filter_output = filter((err-m_err3)/m_h);
   m_err3 = m_err2;
   m_err2 = m_err;
   m_err  = err;
-  return m_kp*(err + m_integral/m_ti + m_td * m_filter_output); 
+  return m_kp*(err + m_integral/m_ti + m_td * m_filter_output);
 }
 
-Filter::Filter()
-{
-  m_state = 0.0;
-  m_T = 0.0025;
-  m_h = 0.0025;
-}
-
-void Filter::reset(void)
-{
-  m_state = 0.0;
-}
-
-void Filter::set_parameter(float T, float h)
-{
-  m_T = T;
-  m_h = h;
-}
-
-float Filter::update(float u)
+// ===== Filter =====
+Filter::Filter(){ m_state = 0.0f; m_T = 0.0025f; m_h = 0.0025f; }
+void   Filter::reset(void){ m_state = 0.0f; }
+void   Filter::set_parameter(float T, float h){ m_T = T; m_h = h; }
+float  Filter::update(float u)
 {
   m_state = m_state * m_T /(m_T + m_h) + u * m_h/(m_T + m_h);
   m_out = m_state;

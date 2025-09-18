@@ -27,9 +27,9 @@ void pwm_init()
     // Set period T
     // T=(wrap+1)*clkdiv/sysclock
     // T=(24999+1)*100/125e6=25000e2/125e6=200e-4=0.02s(=50Hz)
-    pwm_set_wrap(Slice_num_front, 3749);    //pico2の設定
-    pwm_set_wrap(Slice_num_rear,  3749);
-    pwm_set_wrap(Slice_num_servo, 3749);
+    pwm_set_wrap(Slice_num_front, 3124);    //pico2の設定
+    pwm_set_wrap(Slice_num_rear,  3124);
+    pwm_set_wrap(Slice_num_servo, 3124);
 
     pwm_set_clkdiv(Slice_num_front, 100.0);
     pwm_set_clkdiv(Slice_num_rear, 100.0);

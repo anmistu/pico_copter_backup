@@ -21,4 +21,3 @@ extern uint8_t Arm_flag;
 extern semaphore_t sem;
 
 #endif
-
