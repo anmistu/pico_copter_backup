@@ -20,6 +20,30 @@ using namespace Eigen;
 #define BATTERY_VOLTAGE (11.1)
 
 
+// ===== Altitude Hold thin-layer (CH5でON/OFF) =====
+struct AltHoldParams {
+  float z_deadband_m;    // デッドバンド(±m)
+  float ki;              // Iゲイン [duty/(m*s)]
+  float duty_bias_min;   // dutyバイアス下限
+  float duty_bias_max;   // dutyバイアス上限
+  float i_clamp;         // 積分飽和(安全)
+  float tof_timeout_s;   // ToF喪失でOFFまでの猶予[s]
+  float bias_rise_rate;  // bias立上り速度[duty/s]
+  float bias_fall_rate;  // bias立下り速度[duty/s]
+};
+
+extern volatile bool g_alt_hold;  // 高度ホールドON/OFF
+extern AltHoldParams g_ahp;
+
+void  alt_hold_reset();
+void  alt_hold_set_ref(float z_ref_m);
+void  alt_hold_on();
+void  alt_hold_off();
+float alt_hold_apply(float dt, float base_duty, bool thr_low,
+                     bool tof_valid, float z_meas_m, float *out_bias);
+float alt_hold_get_ref();
+
+
 //グローバル関数の宣言
 void loop_400Hz(void);
 void control_init();

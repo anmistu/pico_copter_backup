@@ -37,12 +37,15 @@ pico_enable_stdio_uart(pico_copter 0)
 pico_add_extra_outputs(pico_copter)
 
 
+include_directories(${CMAKE_CURRENT_LIST_DIR}/modules/altitude)
+
 # Include ToF modules and ST driver
 include_directories(${CMAKE_CURRENT_LIST_DIR}/modules/tof)
 include_directories(${CMAKE_CURRENT_LIST_DIR}/third_party/ST_VL53L1X)
 
 # Add ToF and ST sources
 target_sources(pico_copter PRIVATE
+  modules/altitude/alt_ekf.cpp
   modules/tof/tof_bridge.cpp
   modules/tof/tof_vl53l1x.cpp
   third_party/ST_VL53L1X/VL53L1X_api.c
