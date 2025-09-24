@@ -14,6 +14,15 @@
 #include "control.hpp"
 #include "modules/tof/tof_bridge.hpp"  // ★ 追加
 
+#include "modules/altitude_kf.hpp"      // ★追加
+
+// === 二重PID 用 ===
+PID   alt_pos_pid;                      // 外側：位置→速度
+float g_z_hat_m   = 0.0f;               // KF推定
+float g_vz_hat_mps= 0.0f;
+float g_v_ref_mps = 0.0f;
+
+
 // Sensor data
 float Ax,Ay,Az,Wp,Wq,Wr,Mx,My,Mz,Mx0,My0,Mz0,Mx_ave,My_ave,Mz_ave;
 float Acc_norm=0.0;
@@ -290,8 +299,16 @@ void control_init(void)
   theta_pid.set_parameter( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
   psi_pid.set_parameter  ( 0.0f,10.0f, 0.010f, 0.030f, 0.01f);
 
+  // ★ KF初期化（100 Hz想定）
+  altkf_init(0.01f, /*Qz*/1e-4f, /*Qv*/0.25f, /*Rz*/0.0004f);
+  altkf_reset(/*z0*/0.3f, /*vz0*/0.0f); // 適当に開始高さ。飛行開始時に上書きされます
+
+  alt_pos_pid.set_parameter(1.0f, 100000.0f, 0.0f, 0.05f, 0.01f);
+  alt_pos_pid.reset();
+
   // Altitude PID（入力: 高さ誤差[m] → 出力: 推力補正[V]）
-  alt_pid.set_parameter( 0.7f, 1000000.0f, 0.05f, 0.020f, 0.10f ); // まずはP主体
+  alt_pid.set_parameter( 0.7f, 1000.0f, 0.050f, 0.020f, 0.10f ); // まずはP主体
+
   alt_pid.reset();
 
 }
@@ -337,6 +354,8 @@ void motor_stop(void)
 
 // CH5だけで「ログ＋プリセット（固定平均duty＋Δ）＋AltHold(高さPID)」を完結
 // 2ポジ想定：CH5=OFF→手動、CH5=ON→プリセット＋AltHold＋ログ
+// CH5だけで「ログ＋プリセット（固定平均duty＋Δ）＋AltHold(二重PID)」を完結
+// 2ポジ想定：CH5=OFF→手動、CH5=ON→プリセット＋AltHold＋ログ
 void rate_control(void)
 {
   float p_rate, q_rate, r_rate;
@@ -371,52 +390,79 @@ void rate_control(void)
 
   // プリセットに入った瞬間：現在平均から滑らかに移行開始
   if (rising_edge) {
-    float avg_now = 0.25f * (FR_duty + FL_duty + RR_duty + RL_duty);
+    float avg_now = 0.25f*(FR_duty + FL_duty + RR_duty + RL_duty);
     g_cmd_duty = avg_now;
+    // AltHoldターゲット高さを現推定値に
+    g_alt_target_m = g_tof_valid ? (0.001f*(float)g_tof_mm) : g_z_hat_m;
+    alt_pos_pid.reset();
+    alt_pid.reset();
   }
 
   // AltHold 安全判定用 実効duty
   float eff_duty_for_alt = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
   bool  alt_safe = (eff_duty_for_alt >= Flight_duty);
 
-  // CH5 ONで AltHold も同時ON（立ち上がりで目標高さ＆基準推力を記憶）
-  if (rising_edge && g_tof_valid && alt_safe) {
-    g_alt_hold       = true;
-    g_alt_target_m   = 0.001f * (float)g_tof_mm;  // mm→m
-    g_alt_hover_base = T_ref;                     // 現在の推力[V]を基準に
-    alt_pid.reset();
-  }
+  // CH5 OFFで AltHold もOFF
   if (falling_edge) {
     g_alt_hold = false;
+    alt_pos_pid.reset();
     alt_pid.reset();
-    g_alt_u_v = 0.0f;
+    g_alt_u_v   = 0.0f;
+    g_v_ref_mps = 0.0f;
   }
 
-  // AltHoldが有効ならプリセットの目標平均dutyを可変化（“固定duty＋Δ”の形は維持）
-  float preset_target_duty = PRESET_DUTY;
-  if (g_alt_hold && alt_safe && g_tof_valid) {
-    const float z_meas_m = 0.001f * (float)g_tof_mm;
-    float e_m = g_alt_target_m - z_meas_m;       // +: 低い→推力増
-    g_alt_u_v = alt_pid.update(e_m);             // 出力[V]
+  // CH5 ON中は AltHold を許可（ゲートは下の分岐でチェック）
+  if (ch5_on) g_alt_hold = true;
 
-    // Volt→duty へ換算して平均目標を上下
+  // --- 二重（位置→速度）PID with KF（400Hz→100Hzに間引き） ---
+  float preset_target_duty = PRESET_DUTY;
+  static uint8_t alt_div = 0;
+  if (g_alt_hold && alt_safe && g_tof_valid) {
+    // 外側：高さ誤差（+ 低い → 上げたい）
+    float ez = g_alt_target_m - g_z_hat_m;
+    // 微小揺れ抑制（±2〜5cmで調整）
+    if (fabsf(ez) < 0.03f) ez = 0.0f;
+
+    // 100Hzで更新（400Hzループの4回に1回）
+    if (++alt_div >= 4) alt_div = 0;
+    if (alt_div == 0) {
+      // v_ref [m/s] 生成（安全上限）
+      g_v_ref_mps = alt_pos_pid.update(ez);
+      const float VREF_MAX = 0.6f;
+      if (g_v_ref_mps >  VREF_MAX) g_v_ref_mps =  VREF_MAX;
+      if (g_v_ref_mps < -VREF_MAX) g_v_ref_mps = -VREF_MAX;
+
+      // 内側：速度誤差 → 推力補正[V]（飽和時はI凍結）
+      float ev = g_v_ref_mps - g_vz_hat_mps;
+      g_alt_u_v = alt_pid.update(ev);
+      const float UV_MAX = 1.5f;  // ±1.0〜1.5Vで調整
+      if (g_alt_u_v >  UV_MAX){ g_alt_u_v =  UV_MAX; alt_pid.i_reset(); }
+      if (g_alt_u_v < -UV_MAX){ g_alt_u_v = -UV_MAX; alt_pid.i_reset(); }
+    }
+
+    // 平均duty目標へ換算（“固定duty＋Δ”の形は維持）
     float u_duty = g_alt_u_v / BATTERY_VOLTAGE;
     preset_target_duty = PRESET_DUTY + u_duty;
     if (preset_target_duty < Disable_duty) preset_target_duty = Disable_duty;
     if (preset_target_duty > 0.95f)       preset_target_duty = 0.95f;
+  } else {
+    // ゲート外：AltHoldの内部状態をクリーン
+    alt_pos_pid.reset();
+    alt_pid.reset();
+    g_alt_u_v   = 0.0f;
+    g_v_ref_mps = 0.0f;
   }
 
-  // --- Rate PID errors ---
+  // --- レートPID（姿勢） ---
   p_err = p_ref - p_rate;
   q_err = q_ref - q_rate;
   r_err = r_ref - r_rate;
 
-  // --- Rate PID commands ---
   P_com = p_pid.update(p_err);
   Q_com = q_pid.update(q_err);
   R_com = r_pid.update(r_err);
 
-  // --- Mixer (before clamp) ---
+  // --- Mixer（before clamp） ---
   // 1/11.1 ≈ 0.0901
   FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*0.0901f;
   FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*0.0901f;
@@ -424,60 +470,53 @@ void rate_control(void)
   RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25f)*0.0901f;
 
   // --- Clamp ---
-  const float maximum_duty = 0.95f;
-  const float minimum_duty = Disable_duty;
+  const float maximum_duty=0.95f;
+  const float minimum_duty=Disable_duty;
   if (FR_duty < minimum_duty) FR_duty = minimum_duty; if (FR_duty > maximum_duty) FR_duty = maximum_duty;
   if (FL_duty < minimum_duty) FL_duty = minimum_duty; if (FL_duty > maximum_duty) FL_duty = maximum_duty;
   if (RR_duty < minimum_duty) RR_duty = minimum_duty; if (RR_duty > maximum_duty) RR_duty = maximum_duty;
   if (RL_duty < minimum_duty) RL_duty = minimum_duty; if (RL_duty > maximum_duty) RL_duty = maximum_duty;
 
-  // --- Decide target outputs (Δ方式) ---
+  // --- Δ方式の最終化（プリセットONなら平均を g_cmd_duty に合わせる） ---
   float out_fr, out_fl, out_rr, out_rl;
   if (g_preset_mode) {
-    // g_cmd_duty を preset_target_duty へランプ
+    // ランプ（上げ下げ対称。必要なら下げ側だけ STEP を小さく）
     const float diff = preset_target_duty - g_cmd_duty;
     if      (diff >  PRESET_RAMP_STEP) g_cmd_duty += PRESET_RAMP_STEP;
     else if (diff < -PRESET_RAMP_STEP) g_cmd_duty -= PRESET_RAMP_STEP;
     else                               g_cmd_duty  = preset_target_duty;
 
-    const float avg   = 0.25f * (FR_duty + FL_duty + RR_duty + RL_duty);
+    const float avg   = 0.25f*(FR_duty + FL_duty + RR_duty + RL_duty);
     const float delta = g_cmd_duty - avg;
     out_fr = FR_duty + delta;
     out_fl = FL_duty + delta;
     out_rr = RR_duty + delta;
     out_rl = RL_duty + delta;
 
-    // safety clip（最終出力）
+    // 最終安全クリップ
     const float DUTY_MIN = Disable_duty, DUTY_MAX = 0.95f;
     if (out_fr < DUTY_MIN) out_fr = DUTY_MIN; if (out_fr > DUTY_MAX) out_fr = DUTY_MAX;
     if (out_fl < DUTY_MIN) out_fl = DUTY_MIN; if (out_fl > DUTY_MAX) out_fl = DUTY_MAX;
     if (out_rr < DUTY_MIN) out_rr = DUTY_MIN; if (out_rr > DUTY_MAX) out_rr = DUTY_MAX;
     if (out_rl < DUTY_MIN) out_rl = DUTY_MIN; if (out_rl > DUTY_MAX) out_rl = DUTY_MAX;
   } else {
-    out_fr = FR_duty;
-    out_fl = FL_duty;
-    out_rr = RR_duty;
-    out_rl = RL_duty;
+    out_fr = FR_duty; out_fl = FL_duty; out_rr = RR_duty; out_rl = RL_duty;
   }
 
-  // --- 実効duty（preset時はg_cmd_duty、通常時はT_ref/BATTERY_VOLTAGE） ---
+  // 実効duty（preset時はg_cmd_duty、通常時はT_ref/BATTERY_VOLTAGE）
   const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
 
-  // --- Apply safety and send ---
+  // --- 出力（フェイルセーフ付き） ---
   if (eff_duty < Disable_duty) {
     motor_stop();
     p_pid.reset(); q_pid.reset(); r_pid.reset();
     g_out_fr = g_out_fl = g_out_rr = g_out_rl = 0.0f;
     g_out_duty = 0.0f;
   } else {
-    if (OverG_flag == 0){
-      g_out_fr = out_fr; g_out_fl = out_fl;
-      g_out_rr = out_rr; g_out_rl = out_rl;
-      set_duty_fr(out_fr);
-      set_duty_fl(out_fl);
-      set_duty_rr(out_rr);
-      set_duty_rl(out_rl);
-      g_out_duty = 0.25f * (out_fr + out_fl + out_rr + out_rl);
+    if (OverG_flag==0){
+      g_out_fr = out_fr; g_out_fl = out_fl; g_out_rr = out_rr; g_out_rl = out_rl;
+      set_duty_fr(out_fr); set_duty_fl(out_fl); set_duty_rr(out_rr); set_duty_rl(out_rl);
+      g_out_duty = 0.25f*(out_fr+out_fl+out_rr+out_rl);
     } else {
       motor_stop();
       g_out_fr = g_out_fl = g_out_rr = g_out_rl = 0.0f;
@@ -489,40 +528,41 @@ void rate_control(void)
 
 
 
+
 void angle_control(void)
 {
   float phi_err, theta_err, psi_err;
-  float q0, q1, q2, q3;
-  float e23, e33, e13, e11, e12;
+  float q0,q1,q2,q3;
+  float e23,e33,e13,e11,e12;
 
-  while (1)
+  while(1)
   {
     sem_acquire_blocking(&sem);
     sem_reset(&sem, 0);
     S_time2 = time_us_32();
 
-    // 状態推定更新
+    // === 姿勢EKF（四元数）更新 ===
     kalman_filter();
 
-    // クォータニオン → オイラー用の方向余弦要素
-    q0 = Xe(0,0);  q1 = Xe(1,0);  q2 = Xe(2,0);  q3 = Xe(3,0);
+    // === 四元数 → 方向余弦の一部を計算（C_b^i の 1,2,3列の要素を使用）===
+    q0 = Xe(0,0); q1 = Xe(1,0); q2 = Xe(2,0); q3 = Xe(3,0);
     e11 = q0*q0 + q1*q1 - q2*q2 - q3*q3;
     e12 = 2.0f*(q1*q2 + q0*q3);
     e13 = 2.0f*(q1*q3 - q0*q2);
     e23 = 2.0f*(q2*q3 + q0*q1);
     e33 = q0*q0 - q1*q1 - q2*q2 + q3*q3;
 
-    // 機体角度（ラジアン）
-    Phi   = atan2(e23, e33);
-    Theta = atan2(-e13, sqrt(e23*e23 + e33*e33));
-    Psi   = atan2(e12, e11);
+    // === 機体角（ラジアン） ===
+    Phi   = atan2f(e23, e33);
+    Theta = atan2f(-e13, sqrtf(e23*e23 + e33*e33));
+    Psi   = atan2f(e12, e11);
 
-    // 目標角（スティック＋トリム）
-    Phi_ref   = Phi_trim   + 0.3f*M_PI * (float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f) * 2.0f / (CH4MAX-CH4MIN);
-    Theta_ref = Theta_trim + 0.3f*M_PI * (float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f) * 2.0f / (CH2MAX-CH2MIN);
-    Psi_ref   = Psi_trim   + 0.8f*M_PI * (float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f) * 2.0f / (CH1MAX-CH1MIN);
+    // === 角度指令（スティック + トリム）===
+    Phi_ref   = Phi_trim   + 0.3f*M_PI*(float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f)*2.0f/(CH4MAX-CH4MIN);
+    Theta_ref = Theta_trim + 0.3f*M_PI*(float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f)*2.0f/(CH2MAX-CH2MIN);
+    Psi_ref   = Psi_trim   + 0.8f*M_PI*(float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f)*2.0f/(CH1MAX-CH1MIN);
 
-    // 角度誤差
+    // === 角度偏差 ===
     phi_err   = Phi_ref   - (Phi   - Phi_bias);
     theta_err = Theta_ref - (Theta - Theta_bias);
     psi_err   = Psi_ref   - (Psi   - Psi_bias);
@@ -530,45 +570,63 @@ void angle_control(void)
     // 実効duty（rate_control と同定義）
     const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
 
-    // 角度PIDの有効/リセットを実効dutyで判定
+    // === 角度PID（安全ゲート付き）===
     if (eff_duty < Flight_duty)
     {
-      // 出力停止・積分リセット・バイアス/センタ更新
       Pref = Qref = Rref = 0.0f;
       phi_pid.reset(); theta_pid.reset(); psi_pid.reset();
 
+      // スティック中心・角度バイアス更新
       Aileron_center  = Chdata[3];
       Elevator_center = Chdata[1];
       Rudder_center   = Chdata[0];
-
       Phi_bias   = Phi;
       Theta_bias = Theta;
       Psi_bias   = Psi;
     }
     else
     {
-      // Roll/Pitchは角度PID→角速度参照、Yawは従来設計どおり角速度参照=角度誤差
       Pref =  phi_pid.update(phi_err);
       Qref = theta_pid.update(theta_err);
-      Rref = psi_err; // 角度PIDを使わず、角速度参照に誤差を直接
+      Rref = psi_err; // Yawは従来設計：角度誤差をそのまま角速度参照に
     }
 
-    // ===== ToF poll（非ISR / 非ブロッキング） =====
+    // === ToF（非ブロッキング）===
     {
-      uint16_t z = 0;
+      uint16_t zmm = 0;
       tof_poll();
-      bool ok = tof_read_valid(&z);
-      if (ok) { g_tof_valid = true; g_tof_mm = z; }
+      bool ok = tof_read_valid(&zmm);
+      if (ok) { g_tof_valid = true;  g_tof_mm = zmm; }
       else    { g_tof_valid = false; }
     }
 
-    // ログ
+    // === 縦方向 1D-KF（100Hz：本スレ周期に同期）===
+    // Body加速度[m/s^2] → Inertial Z[m/s^2] へ回転し、重力を差し引く
+    // Ax,Ay,Az は sensor_read() で m/s^2 に変換済み
+    const float a_wz = e13*Ax + e23*Ay + e33*Az - 9.80665f; // +: 上向き加速度
+
+    // 予測
+    altkf_step_acc(a_wz);
+    // 観測更新（有効時）
+    if (g_tof_valid) {
+      const float z_meas_m = 0.001f * (float)g_tof_mm;
+      altkf_update_z(z_meas_m);
+    }
+    // 推定値を共有変数へ
+    {
+      AltKFState s = altkf_get();
+      g_z_hat_m    = s.z_m;
+      g_vz_hat_mps = s.vz_mps;
+    }
+
+    // === ログ ===
     logging();
 
     E_time2 = time_us_32();
     D_time2 = E_time2 - S_time2;
   }
 }
+
 
 
 void logging(void)

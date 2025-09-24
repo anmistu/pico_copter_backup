@@ -35,6 +35,11 @@ struct AltHoldParams {
 extern volatile bool g_alt_hold;  // 高度ホールドON/OFF
 extern AltHoldParams g_ahp;
 
+// ★ 追加：二重PIDとKF出力の共有
+extern float g_z_hat_m;            // KF高さ[m]
+extern float g_vz_hat_mps;         // KF鉛直速度[m/s]
+extern float g_v_ref_mps;          // 外側PIDが出す目標速度[m/s]
+
 void  alt_hold_reset();
 void  alt_hold_set_ref(float z_ref_m);
 void  alt_hold_on();
@@ -56,6 +61,7 @@ void log_output(void);
 //グローバル変数
 extern uint8_t LockMode;
 extern volatile uint8_t Logoutputflag;
+
 
 class PID
 {
