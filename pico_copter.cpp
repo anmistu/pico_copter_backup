@@ -10,21 +10,33 @@ semaphore_t sem;
 
 // USB経由でJetsonからdepth情報を受信
 void process_usb_command() {
-    static char buffer[64];
+    static char line[128];
+    if (!fgets(line, sizeof(line), stdin)) return;
 
-    if (fgets(buffer, sizeof(buffer), stdin)) {
-        int dx = 0, dy = 0;
-        float depth = 0;
-        if (sscanf(buffer, "%d,%d,%f", &dx, &dy, &depth) == 3) {
-            printf("[USB] depth=%.2f m dx=%d dy=%d\n", depth, dx, dy);
-            //printf("System clock frequency: %lu Hz\n", clock_get_hz(clk_sys));
-            // ★ depth を使った制御処理をここに追加可能
-        } else {
-            printf("Parse failed: %s\n", buffer);
-        }
-    }
+    // Expect "dx,dy,depth" (depth in meters or millimeters). Robust parse.
+    int dx_i = 0, dy_i = 0;
+    float depth_f = 0.0f;
+    int n = sscanf(line, "%d,%d,%f", &dx_i, &dy_i, &depth_f);
+    if (n < 3) return;
+
+    // If depth seems millimeters (>= 10), convert to meters
+    float depth_m = depth_f;
+    if (depth_m > 10.0f) depth_m = depth_m * 0.001f;
+
+    // Simple low-pass
+    static float dx_f = 0.0f, dy_f = 0.0f, dm_f = 0.0f;
+    const float alpha = 0.25f;
+    dx_f = (1.0f - alpha)*dx_f + alpha*(float)dx_i;
+    dy_f = (1.0f - alpha)*dy_f + alpha*(float)dy_i;
+    dm_f = (1.0f - alpha)*dm_f + alpha*depth_m;
+
+    // Publish to shared vars
+    g_follow_dx         = dx_f;
+    g_follow_dy         = dy_f;
+    g_follow_depth_m    = dm_f;
+    g_follow_last_us    = time_us_32();
+    g_follow_data_valid = true;
 }
-
 int main(void)
 {
   int start_wait=5;

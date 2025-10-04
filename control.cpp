@@ -12,7 +12,37 @@
 //   - ToFの初期化(tof_setup)は main 側で実行してください
 
 #include "control.hpp"
-#include "modules/tof/tof_bridge.hpp"  // ★ 追加
+#include "modules/tof/tof_bridge.hpp"
+
+// ====== Follow control parameters ======
+volatile float     g_follow_dx         = 0.0f;
+volatile float     g_follow_dy         = 0.0f;
+volatile float     g_follow_depth_m    = 0.0f;
+volatile uint32_t  g_follow_last_us    = 0;
+volatile bool      g_follow_data_valid = false;
+volatile bool      g_follow_enabled    = false;
+
+static inline float deg2rad(float d){ return d * (float)M_PI / 180.0f; }
+
+// Target distance [m]
+static const float FOLLOW_DISTANCE_M   = 2.0f;
+// Distance deadband [m]
+static const float FOLLOW_DEADBAND_M   = 0.30f;
+// Pitch command limit [rad] (e.g., ±8 deg)
+static const float FOLLOW_PITCH_MAX    = deg2rad(8.0f);
+// Distance → pitch gain [rad/m] (1.0 m error => ~8 deg)
+static const float FOLLOW_KP_DIST      = FOLLOW_PITCH_MAX / 1.0f;
+// Slew per 100Hz update for pitch [rad] (e.g., 2 deg/update)
+static const float FOLLOW_PITCH_SLEW   = deg2rad(2.0f);
+
+// Yaw: dx full-scale and limits
+static const float FOLLOW_DX_FS_PX     = 320.0f;   // tune to your camera width/2
+static const float FOLLOW_DX_DB_PX     = 10.0f;    // deadband
+static const float FOLLOW_YAW_RATE_MAX = deg2rad(50.0f); // [rad/s]
+
+// USB data timeout to disable follow [us]
+static const uint32_t FOLLOW_TIMEOUT_US = 200000;  // 0.2s
+  // ★ 追加
 
 #include "modules/altitude_kf.hpp"      // ★追加
 
@@ -77,7 +107,7 @@ uint16_t LogdataCounter=0;
 uint8_t Logflag=0;
 volatile uint8_t Logoutputflag=0;
 float Log_time=0.0;
-const uint8_t DATANUM=50;                 // ★ 44 → 45（ToF列を追加）
+const uint8_t DATANUM=55;                 // ★ 44 → 45（ToF列を追加）
 const uint32_t LOGDATANUM=48000;
 float Logdata[LOGDATANUM]={0.0f};
 
