@@ -293,7 +293,7 @@ void control_init(void)
   // Rate control
   p_pid.set_parameter(  1.7f, 0.20f, 0.020f, 0.015f, 0.0025f);
   q_pid.set_parameter(  1.7f, 0.20f, 0.020f, 0.015f, 0.0025f);
-  r_pid.set_parameter( 10.0f, 0.50f, 0.008f, 0.015f, 0.0025f);
+  r_pid.set_parameter( 14.0f, 0.50f, 0.0012f, 0.015f, 0.0025f);
   // Angle control
   phi_pid.set_parameter  ( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
   theta_pid.set_parameter( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
@@ -307,7 +307,7 @@ void control_init(void)
   alt_pos_pid.reset();
 
   // Altitude PID（入力: 高さ誤差[m] → 出力: 推力補正[V]）
-  alt_pid.set_parameter( 1.7f, 1000.0f, 0.050f, 0.020f, 0.10f ); // まずはP主体
+  alt_pid.set_parameter( 1.7f, 1000.0f, 0.055f, 0.020f, 0.10f ); // まずはP主体
 
   alt_pid.reset();
 
