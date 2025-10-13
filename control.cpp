@@ -145,6 +145,8 @@ PID r_pid;
 PID phi_pid;
 PID theta_pid;
 PID psi_pid;
+PID follow_pos_pid;
+PID follow_yaw_pid;
 
 void loop_400Hz(void);
 void rate_control(void);
@@ -323,7 +325,7 @@ void control_init(void)
   // Rate control
   p_pid.set_parameter(  1.7f, 0.20f, 0.020f, 0.015f, 0.0025f);
   q_pid.set_parameter(  1.7f, 0.20f, 0.020f, 0.015f, 0.0025f);
-  r_pid.set_parameter( 5.0f, 0.50f, 0.008f, 0.015f, 0.0025f);
+  r_pid.set_parameter( 14.0f, 0.50f, 0.0012f, 0.015f, 0.0025f);
   // Angle control
   phi_pid.set_parameter  ( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
   theta_pid.set_parameter( 5.5f, 9.5f, 0.005f, 0.018f, 0.01f);
@@ -337,9 +339,16 @@ void control_init(void)
   alt_pos_pid.reset();
 
   // Altitude PID（入力: 高さ誤差[m] → 出力: 推力補正[V]）
-  alt_pid.set_parameter( 0.7f, 1000.0f, 0.050f, 0.020f, 0.10f ); // まずはP主体
-
+  alt_pid.set_parameter( 1.7f, 1000.0f, 0.050f, 0.020f, 0.10f ); // まずはP主体
   alt_pid.reset();
+
+  // ★ 追従：位置PI（距離[m] → ピッチ角[rad]）
+  follow_pos_pid.set_parameter( 0.6f, 1000.0f ,0.07f ,0.020f ,0.01f);
+  follow_pos_pid.reset();
+
+  // ★ 追従：Yaw位置PI（dx正規化[-1..1] → 角速度[rad/s]）
+  follow_yaw_pid.set_parameter( 0.7f, 1000.0f ,0.05f ,0.020f ,0.01f);
+  follow_yaw_pid.reset();
 
 }
 
@@ -386,6 +395,8 @@ void motor_stop(void)
 // 2ポジ想定：CH5=OFF→手動、CH5=ON→プリセット＋AltHold＋ログ
 // CH5だけで「ログ＋プリセット（固定平均duty＋Δ）＋AltHold(二重PID)」を完結
 // 2ポジ想定：CH5=OFF→手動、CH5=ON→プリセット＋AltHold＋ログ
+
+
 void rate_control(void)
 {
   float p_rate, q_rate, r_rate;
@@ -406,7 +417,7 @@ void rate_control(void)
   // --- Throttle base (stick → Volt) ---
   T_ref = 0.6f * BATTERY_VOLTAGE * (float)(Chdata[2]-CH3MIN)/(CH3MAX-CH3MIN);
 
-  // ===== CH5（2ポジ：ONでプリセット＋AltHold＋ログを全部ON）=====
+  // ===== CH5（2ポジ：ONでプリセット＋AltHold＋ログ＋追従を全部ON）=====
   const uint16_t ch5_mid = (CH5MIN + CH5MAX) * 0.5f;
   bool ch5_on = (Chdata[4] > ch5_mid);
 
@@ -417,6 +428,9 @@ void rate_control(void)
 
   // プリセットON/OFF
   g_preset_mode = ch5_on;
+
+  // ★ 追従ON/OFFをCH5に連動（これが追従の主スイッチ）
+  g_follow_enabled = ch5_on;
 
   // プリセットに入った瞬間：現在平均から滑らかに移行開始
   if (rising_edge) {
@@ -448,12 +462,10 @@ void rate_control(void)
   float preset_target_duty = PRESET_DUTY;
   static uint8_t alt_div = 0;
   if (g_alt_hold && alt_safe && g_tof_valid) {
-    // 外側：高さ誤差（+ 低い → 上げたい）
+    // 外側：高さ誤差
     float ez = g_alt_target_m - g_z_hat_m;
-    // 微小揺れ抑制（±2〜5cmで調整）
     if (fabsf(ez) < 0.03f) ez = 0.0f;
 
-    // 100Hzで更新（400Hzループの4回に1回）
     if (++alt_div >= 4) alt_div = 0;
     if (alt_div == 0) {
       // v_ref [m/s] 生成（安全上限）
@@ -462,10 +474,10 @@ void rate_control(void)
       if (g_v_ref_mps >  VREF_MAX) g_v_ref_mps =  VREF_MAX;
       if (g_v_ref_mps < -VREF_MAX) g_v_ref_mps = -VREF_MAX;
 
-      // 内側：速度誤差 → 推力補正[V]（飽和時はI凍結）
+      // 内側：速度誤差 → 推力補正[V]
       float ev = g_v_ref_mps - g_vz_hat_mps;
       g_alt_u_v = alt_pid.update(ev);
-      const float UV_MAX = 1.5f;  // ±1.0〜1.5Vで調整
+      const float UV_MAX = 1.5f;
       if (g_alt_u_v >  UV_MAX){ g_alt_u_v =  UV_MAX; alt_pid.i_reset(); }
       if (g_alt_u_v < -UV_MAX){ g_alt_u_v = -UV_MAX; alt_pid.i_reset(); }
     }
@@ -493,7 +505,6 @@ void rate_control(void)
   R_com = r_pid.update(r_err);
 
   // --- Mixer（before clamp） ---
-  // 1/11.1 ≈ 0.0901
   FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*0.0901f;
   FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*0.0901f;
   RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25f)*0.0901f;
@@ -510,7 +521,6 @@ void rate_control(void)
   // --- Δ方式の最終化（プリセットONなら平均を g_cmd_duty に合わせる） ---
   float out_fr, out_fl, out_rr, out_rl;
   if (g_preset_mode) {
-    // ランプ（上げ下げ対称。必要なら下げ側だけ STEP を小さく）
     const float diff = preset_target_duty - g_cmd_duty;
     if      (diff >  PRESET_RAMP_STEP) g_cmd_duty += PRESET_RAMP_STEP;
     else if (diff < -PRESET_RAMP_STEP) g_cmd_duty -= PRESET_RAMP_STEP;
@@ -523,7 +533,6 @@ void rate_control(void)
     out_rr = RR_duty + delta;
     out_rl = RL_duty + delta;
 
-    // 最終安全クリップ
     const float DUTY_MIN = Disable_duty, DUTY_MAX = 0.95f;
     if (out_fr < DUTY_MIN) out_fr = DUTY_MIN; if (out_fr > DUTY_MAX) out_fr = DUTY_MAX;
     if (out_fl < DUTY_MIN) out_fl = DUTY_MIN; if (out_fl > DUTY_MAX) out_fl = DUTY_MAX;
@@ -555,26 +564,26 @@ void rate_control(void)
   }
 }
 
-
-
-
-
 void angle_control(void)
 {
   float phi_err, theta_err, psi_err;
   float q0,q1,q2,q3;
   float e23,e33,e13,e11,e12;
 
-  while(1)
+  // 追従（位置PI）で加算するピッチ角 [rad]
+  static float theta_add = 0.0f;
+
+  while (1)
   {
+    // 100 Hz駆動（semはrate_control側から4回に1回ポスト）
     sem_acquire_blocking(&sem);
     sem_reset(&sem, 0);
     S_time2 = time_us_32();
 
-    // === 姿勢EKF（四元数）更新 ===
+    // === 姿勢EKF更新 ===
     kalman_filter();
 
-    // === 四元数 → 方向余弦の一部を計算（C_b^i の 1,2,3列の要素を使用）===
+    // === 四元数→方向余弦成分 ===
     q0 = Xe(0,0); q1 = Xe(1,0); q2 = Xe(2,0); q3 = Xe(3,0);
     e11 = q0*q0 + q1*q1 - q2*q2 - q3*q3;
     e12 = 2.0f*(q1*q2 + q0*q3);
@@ -582,22 +591,57 @@ void angle_control(void)
     e23 = 2.0f*(q2*q3 + q0*q1);
     e33 = q0*q0 - q1*q1 - q2*q2 + q3*q3;
 
-    // === 機体角（ラジアン） ===
+    // === 機体角 ===
     Phi   = atan2f(e23, e33);
     Theta = atan2f(-e13, sqrtf(e23*e23 + e33*e33));
     Psi   = atan2f(e12, e11);
 
-    // === 角度指令（スティック + トリム）===
-    Phi_ref   = Phi_trim   + 0.3f*M_PI*(float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f)*2.0f/(CH4MAX-CH4MIN);
-    Theta_ref = Theta_trim + 0.3f*M_PI*(float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f)*2.0f/(CH2MAX-CH2MIN);
-    Psi_ref   = Psi_trim   + 0.8f*M_PI*(float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f)*2.0f/(CH1MAX-CH1MIN);
+    // === スティック→角度参照 ===
+    Phi_ref   = Phi_trim   + 0.3f*M_PI * (float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f) * 2.0f/(CH4MAX-CH4MIN);
+    Theta_ref = Theta_trim + 0.3f*M_PI * (float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f) * 2.0f/(CH2MAX-CH2MIN);
+    Psi_ref   = Psi_trim   + 0.8f*M_PI * (float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f) * 2.0f/(CH1MAX-CH1MIN);
+
+    // === 追従：距離→ピッチ角（位置PIのみ）===
+    {
+      const bool follow_on = g_follow_enabled;
+      const bool fresh = g_follow_data_valid &&
+                         (time_us_32() - g_follow_last_us <= FOLLOW_TIMEOUT_US);
+
+      if (follow_on && fresh) {
+        // 距離誤差（+：遠い→前進ピッチ）
+        float e_pos = FOLLOW_DISTANCE_M - g_follow_depth_m;
+        if (fabsf(e_pos) < FOLLOW_DEADBAND_M) e_pos = 0.0f;
+
+        // 位置PIの出力を「目標ピッチ角」として使用
+        float theta_target = follow_pos_pid.update(e_pos);
+
+        // 上限（±FOLLOW_PITCH_MAX）＋簡易アンチワインドアップ
+        if (theta_target >  FOLLOW_PITCH_MAX) { theta_target =  FOLLOW_PITCH_MAX; follow_pos_pid.i_reset(); }
+        if (theta_target < -FOLLOW_PITCH_MAX) { theta_target = -FOLLOW_PITCH_MAX; follow_pos_pid.i_reset(); }
+
+        // スルーレート制限（100 Hz）
+        float dth = theta_target - theta_add;
+        if      (dth >  FOLLOW_PITCH_SLEW) theta_add += FOLLOW_PITCH_SLEW;
+        else if (dth < -FOLLOW_PITCH_SLEW) theta_add -= FOLLOW_PITCH_SLEW;
+        else                               theta_add  = theta_target;
+      } else {
+        // 追従OFF/ロスト：なめらかに0へ復帰、積分はリセット
+        if      (theta_add >  FOLLOW_PITCH_SLEW) theta_add -= FOLLOW_PITCH_SLEW;
+        else if (theta_add < -FOLLOW_PITCH_SLEW) theta_add += FOLLOW_PITCH_SLEW;
+        else                                     theta_add  = 0.0f;
+        follow_pos_pid.reset();
+      }
+
+      // 角度偏差を作る前に追従のピッチ加算を適用
+      Theta_ref += theta_add;
+    }
 
     // === 角度偏差 ===
     phi_err   = Phi_ref   - (Phi   - Phi_bias);
     theta_err = Theta_ref - (Theta - Theta_bias);
     psi_err   = Psi_ref   - (Psi   - Psi_bias);
 
-    // 実効duty（rate_control と同定義）
+    // 実効duty（preset時はg_cmd_duty、通常時はT_ref/BATTERY_VOLTAGE）
     const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
 
     // === 角度PID（安全ゲート付き）===
@@ -613,12 +657,48 @@ void angle_control(void)
       Phi_bias   = Phi;
       Theta_bias = Theta;
       Psi_bias   = Psi;
+
+      // 追従PIDもリセット
+      follow_pos_pid.reset();
+      follow_yaw_pid.reset();
     }
     else
     {
+      // 外側Angle-PID → 内側Rate参照
       Pref =  phi_pid.update(phi_err);
       Qref = theta_pid.update(theta_err);
-      Rref = psi_err; // Yawは従来設計：角度誤差をそのまま角速度参照に
+      Rref = psi_err;  // Yawは角度誤差→角速度参照がベース
+
+      // === Yaw：dx → 角速度（位置PI） ===
+      float r_add = 0.0f;
+      const bool follow_on = g_follow_enabled;
+      const bool fresh = g_follow_data_valid &&
+                         (time_us_32() - g_follow_last_us <= FOLLOW_TIMEOUT_US);
+
+      if (follow_on && fresh) {
+        float dx = g_follow_dx;
+
+        // デッドバンド＆正規化 [-1..1]
+        float sgn = (dx >= 0.0f) ? 1.0f : -1.0f;
+        float mag = fabsf(dx) - FOLLOW_DX_DB_PX;
+        if (mag < 0.0f) mag = 0.0f;
+        float ex = (FOLLOW_DX_FS_PX > 1e-6f) ? (mag / FOLLOW_DX_FS_PX) : 0.0f; // 0..1
+        if (ex > 1.0f) ex = 1.0f;
+        ex *= sgn; // -1..1
+
+        // 位置PI → 角速度
+        r_add = follow_yaw_pid.update(ex);
+
+        // 上限（±FOLLOW_YAW_RATE_MAX）＋簡易アンチワインドアップ
+        if (r_add >  FOLLOW_YAW_RATE_MAX) { r_add =  FOLLOW_YAW_RATE_MAX; follow_yaw_pid.i_reset(); }
+        if (r_add < -FOLLOW_YAW_RATE_MAX) { r_add = -FOLLOW_YAW_RATE_MAX; follow_yaw_pid.i_reset(); }
+      } else {
+        follow_yaw_pid.reset();
+        r_add = 0.0f;
+      }
+
+      // 角速度参照に加算（内側r_pidが速度制御）
+      Rref += r_add;
     }
 
     // === ToF（非ブロッキング）===
@@ -630,20 +710,14 @@ void angle_control(void)
       else    { g_tof_valid = false; }
     }
 
-    // === 縦方向 1D-KF（100Hz：本スレ周期に同期）===
-    // Body加速度[m/s^2] → Inertial Z[m/s^2] へ回転し、重力を差し引く
-    // Ax,Ay,Az は sensor_read() で m/s^2 に変換済み
-    const float a_wz = e13*Ax + e23*Ay + e33*Az - 9.80665f; // +: 上向き加速度
-
-    // 予測
-    altkf_step_acc(a_wz);
-    // 観測更新（有効時）
-    if (g_tof_valid) {
-      const float z_meas_m = 0.001f * (float)g_tof_mm;
-      altkf_update_z(z_meas_m);
-    }
-    // 推定値を共有変数へ
+    // === 縦方向 1D-KF（100Hz）===
     {
+      const float a_wz = e13*Ax + e23*Ay + e33*Az - 9.80665f; // +: 上向き
+      altkf_step_acc(a_wz);
+      if (g_tof_valid) {
+        const float z_meas_m = 0.001f * (float)g_tof_mm;
+        altkf_update_z(z_meas_m);
+      }
       AltKFState s = altkf_get();
       g_z_hat_m    = s.z_m;
       g_vz_hat_mps = s.vz_mps;
@@ -656,6 +730,8 @@ void angle_control(void)
     D_time2 = E_time2 - S_time2;
   }
 }
+
+
 
 
 

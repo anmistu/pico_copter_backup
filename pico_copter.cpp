@@ -36,6 +36,8 @@ void process_usb_command() {
     g_follow_depth_m    = dm_f;
     g_follow_last_us    = time_us_32();
     g_follow_data_valid = true;
+
+    printf("[USB] depth=%.2f m dx=%.2f dy=%.2f\n", g_follow_depth_m,g_follow_dx,g_follow_dy);
 }
 int main(void)
 {
@@ -51,7 +53,7 @@ int main(void)
   variable_init();
   control_init();
 
-  ESC_calib=1;    //初回のみ1にしてESCをキャリブレーション
+  ESC_calib=0;    //初回のみ1にしてESCをキャリブレーション
   pwm_init();
 
   while(start_wait)
