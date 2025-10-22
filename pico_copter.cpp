@@ -1,7 +1,7 @@
 #include "pico_copter.hpp"
 #include "hardware/clocks.h"
 #include "modules/tof/tof_bridge.hpp"
-
+#include "modules/ina219.hpp"
 #include <stdio.h>
 
 // グローバル変数
@@ -55,7 +55,10 @@ int main(void)
   
   // Core起動前後どちらでもOK（ISR中はNG）
   tof_setup();
-
+  ina219_setup(i2c1, 0x40);
+  ina219_set_vref_V(11.1f);
+  ina219_set_thresholds(11.2f, 10.8f);
+  ina219_set_iir_alpha(0.10f);
 
   Arm_flag=1;
 

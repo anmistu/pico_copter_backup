@@ -13,8 +13,15 @@
 
 #include "control.hpp"
 #include "modules/tof/tof_bridge.hpp"  // ★ 追加
-
+#include "modules/ina219.hpp"
 #include "modules/altitude_kf.hpp"      // ★追加
+#include "rgbled.hpp"
+#include "pico/stdlib.h"
+#include "modules/spi_ws2812.hpp"
+
+#ifndef WS2812_COUNT
+#define WS2812_COUNT 16         // ★ 16発に統一
+#endif
 
 // === 二重PID 用 ===
 PID   alt_pos_pid;                      // 外側：位置→速度
@@ -59,6 +66,11 @@ static float  g_alt_target_m   = 0.5f;  // ONした瞬間の高さ[m]
 static float  g_alt_hover_base = 2.2f;  // [V] ON時のT_refを保持（非プリセット時用）
 static float  g_alt_u_v        = 0.0f;  // PID出力[V]（デバッグ/解析用）
 
+static inline float volts_inv() {
+    float V = ina219_get_vbus_filt_V();
+    if (V < 9.0f) V = 9.0f;
+    return 1.0f / V;
+}
 
 // Extended Kalman filter
 Matrix<float, 7 ,1> Xp = MatrixXf::Zero(7,1);
@@ -101,6 +113,81 @@ static float g_out_rl = 0.0f;
 static volatile bool     g_tof_valid = false;
 static volatile uint16_t g_tof_mm    = 0;    // [mm]
 
+// --- LED Control (50Hz) ---
+static void led_control_50Hz()
+{
+    static uint32_t last_us = 0;
+    static uint16_t blink = 0;
+    const uint32_t now = time_us_32();
+
+    // 20msごと（50Hz）に更新
+    if (now - last_us < 20000) return;
+    last_us = now;
+
+    // 低電圧判定（Benzen_new相当：INA219の平滑V）
+    float Vbat = ina219_get_vbus_filt_V();    // 既存関数（backup内でも使用されています）
+    if (Vbat < 9.0f) Vbat = 9.0f;
+
+    // 状態に応じた表示
+    if (Arm_flag == 0 || Arm_flag == 1) {
+        // アーム待機
+        rgbled_wait();
+        return;
+    }
+
+    if (Arm_flag == 2) {
+        // 飛行中
+        // 1) 致命的低電圧（Benzen_newでは10.8V付近で判定）
+        if (Vbat <= 10.8f) {
+            rgbled_red();                 // 赤：危険
+            return;
+        }
+        // 2) ToFが失効（Benzen_newでは異常系で色替え）
+        extern volatile bool g_tof_valid; // backup側に既存
+        if (!g_tof_valid) {
+            rgbled_blue();                // 青：高さセンサ無効
+            return;
+        }
+        // 3) AltHold ON中のハートビート（Benzen_new相当の“モード可視化”）
+        extern volatile bool g_alt_hold;  // backup側に既存
+        if (g_alt_hold) {
+            // 緑の点滅(約1Hz)で“高度維持”を可視化
+            if ((blink++ % 50) < 25) rgbled_green();
+            else                     rgbled_off();
+            return;
+        }
+
+        // 4) 通常飛行
+        rgbled_normal();
+        return;
+    }
+
+    if (Arm_flag == 3) {
+        // ディスアーム完了：緑の点滅で完了合図（Benzen_new互換）
+        if ((blink++ % 50) < 25) rgbled_green();
+        else                     rgbled_off();
+        return;
+    }
+}
+
+static void led_mirror_50Hz()
+{
+    static uint8_t div8 = 0;       // 400Hz ループを 8回に1回 = 50Hz で更新
+    if (++div8 < 8) return;
+    div8 = 0;
+
+    bool on = gpio_get(LED_PIN);   // GP25 の現在状態（点灯=1, 消灯=0）
+
+    if (on) {
+        // 緑点灯（R,G,B）= (0,255,0)
+        spi_ws2812_fill_rgb(0, 255, 0, WS2812_COUNT);
+    } else {
+        // 全消灯
+        spi_ws2812_fill_rgb(0, 0, 0, WS2812_COUNT);
+    }
+}
+
+
 // State Machine
 uint8_t LockMode=0;
 float Disable_duty =0.10f;
@@ -141,6 +228,8 @@ void loop_400Hz(void)
 
   // 割り込みフラグリセット
   pwm_clear_irq(3);
+
+  led_mirror_50Hz();
 
   if (Arm_flag==0)
   {
@@ -238,6 +327,9 @@ void loop_400Hz(void)
     if(Logflag==1&&LedBlinkCounter<100) LedBlinkCounter++;
     else { LedBlinkCounter=0; led=!led; }
 
+    //テープLED関連
+    led_control_50Hz();
+    
     // Rate Control (400Hz)
     rate_control();
 
@@ -441,7 +533,7 @@ void rate_control(void)
     }
 
     // 平均duty目標へ換算（“固定duty＋Δ”の形は維持）
-    float u_duty = g_alt_u_v / BATTERY_VOLTAGE;
+    float u_duty = g_alt_u_v / volts_inv();
     preset_target_duty = PRESET_DUTY + u_duty;
     if (preset_target_duty < Disable_duty) preset_target_duty = Disable_duty;
     if (preset_target_duty > 0.95f)       preset_target_duty = 0.95f;
@@ -464,10 +556,10 @@ void rate_control(void)
 
   // --- Mixer（before clamp） ---
   // 1/11.1 ≈ 0.0901
-  FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*0.0901f;
-  FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*0.0901f;
-  RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25f)*0.0901f;
-  RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25f)*0.0901f;
+  FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*volts_inv();
+  FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*volts_inv();
+  RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25f)*volts_inv();
+  RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25f)*volts_inv();
 
   // --- Clamp ---
   const float maximum_duty=0.95f;
@@ -537,6 +629,7 @@ void angle_control(void)
 
   while(1)
   {
+    // Core1 同期
     sem_acquire_blocking(&sem);
     sem_reset(&sem, 0);
     S_time2 = time_us_32();
@@ -544,7 +637,7 @@ void angle_control(void)
     // === 姿勢EKF（四元数）更新 ===
     kalman_filter();
 
-    // === 四元数 → 方向余弦の一部を計算（C_b^i の 1,2,3列の要素を使用）===
+    // === 四元数 → 方向余弦の一部を計算（C_b^i の要素を使用）===
     q0 = Xe(0,0); q1 = Xe(1,0); q2 = Xe(2,0); q3 = Xe(3,0);
     e11 = q0*q0 + q1*q1 - q2*q2 - q3*q3;
     e12 = 2.0f*(q1*q2 + q0*q3);
@@ -558,21 +651,25 @@ void angle_control(void)
     Psi   = atan2f(e12, e11);
 
     // === 角度指令（スティック + トリム）===
-    Phi_ref   = Phi_trim   + 0.3f*M_PI*(float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f)*2.0f/(CH4MAX-CH4MIN);
-    Theta_ref = Theta_trim + 0.3f*M_PI*(float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f)*2.0f/(CH2MAX-CH2MIN);
-    Psi_ref   = Psi_trim   + 0.8f*M_PI*(float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f)*2.0f/(CH1MAX-CH1MIN);
+    Phi_ref   = Phi_trim   + 0.3f*M_PI * (float)(Chdata[3] - (CH4MAX+CH4MIN)*0.5f) * 2.0f / (CH4MAX-CH4MIN);
+    Theta_ref = Theta_trim + 0.3f*M_PI * (float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f) * 2.0f / (CH2MAX-CH2MIN);
+    Psi_ref   = Psi_trim   + 0.8f*M_PI * (float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f) * 2.0f / (CH1MAX-CH1MIN);
 
     // === 角度偏差 ===
     phi_err   = Phi_ref   - (Phi   - Phi_bias);
     theta_err = Theta_ref - (Theta - Theta_bias);
     psi_err   = Psi_ref   - (Psi   - Psi_bias);
 
-    // 実効duty（rate_control と同定義）
-    const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
+    // === 実効duty（安全ゲート判定用）===
+    // ※ ここを「固定 11.1V」から「INA219で測った実測電圧」に変更
+    float Vbat = ina219_get_vbus_filt_V();
+    if (Vbat < 9.0f) Vbat = 9.0f; // 下限クリップ（安全側）
+    const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / Vbat);
 
     // === 角度PID（安全ゲート付き）===
     if (eff_duty < Flight_duty)
     {
+      // 推力が小さい＝離地前/停止近傍：角度ループはリセット＆バイアス更新
       Pref = Qref = Rref = 0.0f;
       phi_pid.reset(); theta_pid.reset(); psi_pid.reset();
 
@@ -586,9 +683,10 @@ void angle_control(void)
     }
     else
     {
+      // 飛行中：角度PID（Yawは従来通り角速度参照に直結）
       Pref =  phi_pid.update(phi_err);
       Qref = theta_pid.update(theta_err);
-      Rref = psi_err; // Yawは従来設計：角度誤差をそのまま角速度参照に
+      Rref = psi_err;  // 必要なら psi_pid.update(psi_err) に切り替え可
     }
 
     // === ToF（非ブロッキング）===
@@ -600,18 +698,31 @@ void angle_control(void)
       else    { g_tof_valid = false; }
     }
 
-    // === 縦方向 1D-KF（100Hz：本スレ周期に同期）===
+    // === バッテリー電圧（INA219）ポーリング ===
+    // ToF と同じ Core/スレッドで、I2C を順番に叩いて競合回避（25〜40Hz）
+    {
+      static uint32_t last_ina_ms = 0;
+      const uint32_t now = to_ms_since_boot(get_absolute_time());
+      if (now - last_ina_ms >= 25) {   // ≒ 40Hz
+        last_ina_ms = now;
+        ina219_poll();
+      }
+    }
+
+    // === 縦方向 1D-KF（本スレ周期に同期）===
     // Body加速度[m/s^2] → Inertial Z[m/s^2] へ回転し、重力を差し引く
     // Ax,Ay,Az は sensor_read() で m/s^2 に変換済み
     const float a_wz = e13*Ax + e23*Ay + e33*Az - 9.80665f; // +: 上向き加速度
 
     // 予測
     altkf_step_acc(a_wz);
-    // 観測更新（有効時）
+
+    // 観測更新（ToF有効時）
     if (g_tof_valid) {
       const float z_meas_m = 0.001f * (float)g_tof_mm;
       altkf_update_z(z_meas_m);
     }
+
     // 推定値を共有変数へ
     {
       AltKFState s = altkf_get();
@@ -626,6 +737,7 @@ void angle_control(void)
     D_time2 = E_time2 - S_time2;
   }
 }
+
 
 
 

@@ -21,6 +21,8 @@ add_executable(pico_copter
   pwm.cpp
   radio.cpp
   control.cpp
+  modules/ina219.cpp
+  modules/spi_ws2812.cpp
 )
 
 target_link_libraries(pico_copter 
@@ -29,7 +31,12 @@ target_link_libraries(pico_copter
   hardware_uart 
   pico_stdlib
   hardware_i2c
+  hardware_pio
+  hardware_dma
   pico_multicore)
+
+
+target_include_directories(pico_copter PRIVATE ${CMAKE_CURRENT_LIST_DIR}/modules)
 
 pico_enable_stdio_usb(pico_copter 1)
 pico_enable_stdio_uart(pico_copter 0)
@@ -50,4 +57,18 @@ target_sources(pico_copter PRIVATE
   modules/tof/tof_vl53l1x.cpp
   third_party/ST_VL53L1X/VL53L1X_api.c
   third_party/ST_VL53L1X/vl53l1_platform.c
+)
+# --- WS2812 LED strip ---
+target_sources(pico_copter PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/modules/ws2812/WS2812.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/modules/rgbled/rgbled.cpp
+)
+
+# 必要ならインクルードパス
+target_include_directories(pico_copter PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/modules/ws2812
+    ${CMAKE_CURRENT_LIST_DIR}/modules/rgbled
+)
+pico_generate_pio_header(pico_copter
+    ${CMAKE_CURRENT_LIST_DIR}/modules/ws2812/WS2812.pio
 )
