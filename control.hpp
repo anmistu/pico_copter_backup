@@ -8,6 +8,7 @@
 #include "hardware/pwm.h"
 #include "hardware/irq.h"
 #include <Eigen/Dense>
+#include "modules/rgbled/rgbled.hpp"
 #include "ekf.hpp"
 #include <math.h>
 
@@ -57,6 +58,7 @@ void angle_control(void);
 void gyro_calibration(void);
 void variable_init(void);
 void log_output(void);
+void cam_link_touch();
 
 //グローバル変数
 extern uint8_t LockMode;

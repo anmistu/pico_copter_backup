@@ -1,7 +1,7 @@
 #include "pico_copter.hpp"
 #include "hardware/clocks.h"
 #include "modules/tof/tof_bridge.hpp"
-
+#include "modules/rgbled/rgbled.hpp"
 #include <stdio.h>
 
 // グローバル変数
@@ -18,6 +18,8 @@ void process_usb_command() {
     float depth_f = 0.0f;
     int n = sscanf(line, "%d,%d,%f", &dx_i, &dy_i, &depth_f);
     if (n < 3) return;
+
+    cam_link_touch();
 
     // If depth seems millimeters (>= 10), convert to meters
     float depth_m = depth_f;

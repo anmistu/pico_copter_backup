@@ -13,6 +13,15 @@
 
 #include "control.hpp"
 #include "modules/tof/tof_bridge.hpp"
+#include "pico/stdlib.h"
+#include "modules/altitude_kf.hpp"      // ★追加
+
+#ifndef CAM_TIMEOUT_MS
+#define CAM_TIMEOUT_MS 800   // 受信がこのミリ秒以上途絶→リンクダウン扱い
+#endif
+
+static uint32_t g_cam_last_ms  = 0;   // 最終受信時刻[ms]
+static bool     g_cam_link_down = true; // 起動直後は未接続扱い
 
 // ====== Follow control parameters ======
 volatile float     g_follow_dx         = 0.0f;
@@ -42,10 +51,6 @@ static const float FOLLOW_YAW_RATE_MAX = deg2rad(50.0f); // [rad/s]
 
 // USB data timeout to disable follow [us]
 static const uint32_t FOLLOW_TIMEOUT_US = 200000;  // 0.2s
-  // ★ 追加
-
-#include "modules/altitude_kf.hpp"      // ★追加
-
 // === 二重PID 用 ===
 PID   alt_pos_pid;                      // 外側：位置→速度
 float g_z_hat_m   = 0.0f;               // KF推定
@@ -165,6 +170,61 @@ void printPQR(void);
 #define AVERAGE    2000
 #define KALMANWAIT 6000
 
+
+void cam_link_touch() {
+  g_cam_last_ms   = to_ms_since_boot(get_absolute_time());
+  g_cam_link_down = false;
+}
+
+void led_control(void)
+{
+
+  const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+  g_cam_link_down = (now_ms - g_cam_last_ms > CAM_TIMEOUT_MS);
+  
+  if (g_preset_mode) {          // ← CH5に連動しているフラグ
+    if (g_cam_link_down) {
+      rgbled_red();
+      return;
+    } else {
+      rgbled_blue();
+      return;
+    }
+  }
+
+  static uint16_t cnt = 0;
+
+  if(g_preset_mode){
+    rgbled_blue();
+    return;
+  }
+  if (Arm_flag == 0 || Arm_flag == 1) {
+    rgbled_wait();
+  }
+  else if (Arm_flag == 2 ) {
+
+    // 0→1 に変わった瞬間だけ赤LED
+    rgbled_green();
+  
+  }
+
+  else if (Arm_flag == 2 ) {
+    rgbled_redcircle();
+  }
+  else if (Arm_flag == 2 ) {
+    rgbled_red();
+  }
+
+  else if (Arm_flag == 3) {
+    if (cnt == 0) rgbled_green();
+    if (cnt == 50) rgbled_off();
+    cnt++;
+    if (cnt == 100) cnt = 0;
+  }
+
+  // 次回の判定用に状態を保存
+}
+
 // Main loop (called from PWM interrupt @400Hz)
 void loop_400Hz(void)
 {
@@ -173,6 +233,8 @@ void loop_400Hz(void)
 
   // 割り込みフラグリセット
   pwm_clear_irq(3);
+
+  led_control();
 
   if (Arm_flag==0)
   {
@@ -252,7 +314,6 @@ void loop_400Hz(void)
       if(lock_com()==1){
         LockMode=3; // Disable Flight
         led=0;
-        gpio_put(LED_PIN,led);
         return;
       }
     }
@@ -265,8 +326,6 @@ void loop_400Hz(void)
       return;
     }
 
-    // LED Blink
-    gpio_put(LED_PIN, led);
     if(Logflag==1&&LedBlinkCounter<100) LedBlinkCounter++;
     else { LedBlinkCounter=0; led=!led; }
 
@@ -309,8 +368,6 @@ void loop_400Hz(void)
   {
     motor_stop();
     Logoutputflag=1;
-    // LED Blink
-    gpio_put(LED_PIN, led);
     if(LedBlinkCounter<400) LedBlinkCounter++;
     else { LedBlinkCounter=0; led=!led; }
   }
@@ -434,6 +491,7 @@ void rate_control(void)
 
   // プリセットに入った瞬間：現在平均から滑らかに移行開始
   if (rising_edge) {
+    rgbled_blue();
     float avg_now = 0.25f*(FR_duty + FL_duty + RR_duty + RL_duty);
     g_cmd_duty = avg_now;
     // AltHoldターゲット高さを現推定値に
@@ -457,7 +515,6 @@ void rate_control(void)
 
   // CH5 ON中は AltHold を許可（ゲートは下の分岐でチェック）
   if (ch5_on) g_alt_hold = true;
-
   // --- 二重（位置→速度）PID with KF（400Hz→100Hzに間引き） ---
   float preset_target_duty = PRESET_DUTY;
   static uint8_t alt_div = 0;
