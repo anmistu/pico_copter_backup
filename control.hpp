@@ -18,7 +18,7 @@ using Eigen::Matrix;
 using Eigen::PartialPivLU;
 using namespace Eigen;
 
-#define BATTERY_VOLTAGE (11.1)
+#define BATTERY_VOLTAGE (18.5)
 
 
 // ===== Altitude Hold thin-layer (CH5でON/OFF) =====

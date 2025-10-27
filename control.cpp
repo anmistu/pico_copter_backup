@@ -15,6 +15,7 @@
 #include "modules/tof/tof_bridge.hpp"
 #include "pico/stdlib.h"
 #include "modules/altitude_kf.hpp"      // ★追加
+#include "modules/ina219.hpp"
 
 #ifndef CAM_TIMEOUT_MS
 #define CAM_TIMEOUT_MS 800   // 受信がこのミリ秒以上途絶→リンクダウン扱い
@@ -34,7 +35,7 @@ volatile bool      g_follow_enabled    = false;
 static inline float deg2rad(float d){ return d * (float)M_PI / 180.0f; }
 
 // Target distance [m]
-static const float FOLLOW_DISTANCE_M   = 2.0f;
+static const float FOLLOW_DISTANCE_M   = 2.5f;
 // Distance deadband [m]
 static const float FOLLOW_DEADBAND_M   = 0.30f;
 // Pitch command limit [rad] (e.g., ±8 deg)
@@ -112,13 +113,13 @@ uint16_t LogdataCounter=0;
 uint8_t Logflag=0;
 volatile uint8_t Logoutputflag=0;
 float Log_time=0.0;
-const uint8_t DATANUM=55;                 // ★ 44 → 45（ToF列を追加）
+const uint8_t DATANUM=61;                 // ★ 61
 const uint32_t LOGDATANUM=48000;
 float Logdata[LOGDATANUM]={0.0f};
 
 // === Preset Fixed-Thrust Mode (CH5) ===
 // 平均推力のみを合わせ、姿勢補正(差分)は保持する
-static const float PRESET_DUTY      = 0.34f;                 // 目標平均duty
+static const float PRESET_DUTY      = 0.38f;                 // 目標平均duty
 static const float PRESET_RAMP_SEC  = 0.30f;                 // ランプ時間[s]
 static const float PRESET_RAMP_STEP = (1.0f/400.0f)/PRESET_RAMP_SEC;
 
@@ -400,7 +401,7 @@ void control_init(void)
   alt_pid.reset();
 
   // ★ 追従：位置PI（距離[m] → ピッチ角[rad]）
-  follow_pos_pid.set_parameter( 0.6f, 1000.0f ,0.07f ,0.020f ,0.01f);
+  follow_pos_pid.set_parameter( 1.3f, 1000.0f ,0.07f ,0.020f ,0.01f);
   follow_pos_pid.reset();
 
   // ★ 追従：Yaw位置PI（dx正規化[-1..1] → 角速度[rad/s]）
@@ -562,10 +563,14 @@ void rate_control(void)
   R_com = r_pid.update(r_err);
 
   // --- Mixer（before clamp） ---
-  FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*0.0901f;
-  FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*0.0901f;
-  RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25f)*0.0901f;
-  RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25f)*0.0901f;
+
+  float vbat_mixer = ina219_get_vbus_filt_V(); if (vbat_mixer < 9.0f) vbat_mixer = 9.0f;
+  const float inv_vbat = 1.0f / vbat_mixer;
+
+  FR_duty = (T_ref +(-P_com +Q_com -R_com)*0.25f)*inv_vbat;
+  FL_duty = (T_ref +( P_com +Q_com +R_com)*0.25f)*inv_vbat;
+  RR_duty = (T_ref +(-P_com -Q_com +R_com)*0.25f)*inv_vbat;
+  RL_duty = (T_ref +( P_com -Q_com -R_com)*0.25f)*inv_vbat;
 
   // --- Clamp ---
   const float maximum_duty=0.95f;
@@ -598,9 +603,10 @@ void rate_control(void)
   } else {
     out_fr = FR_duty; out_fl = FL_duty; out_rr = RR_duty; out_rl = RL_duty;
   }
-
-  // 実効duty（preset時はg_cmd_duty、通常時はT_ref/BATTERY_VOLTAGE）
-  const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / BATTERY_VOLTAGE);
+  
+  float vbat = ina219_get_vbus_filt_V();
+  if (vbat < 9.0f) vbat = 9.0f;              // 下限クランプ（過補償防止）
+  const float eff_duty = g_preset_mode ? g_cmd_duty : (T_ref / vbat);
 
   // --- 出力（フェイルセーフ付き） ---
   if (eff_duty < Disable_duty) {
@@ -767,6 +773,14 @@ void angle_control(void)
       else    { g_tof_valid = false; }
     }
 
+    {
+      static uint8_t ina_cnt = 0;
+      if (++ina_cnt >= 2) {    // angle_controlが100Hz想定 → 100/2=50Hz
+        ina_cnt = 0;
+        ina219_poll();
+      }
+    }
+
     // === 縦方向 1D-KF（100Hz）===
     {
       const float a_wz = e13*Ax + e23*Ay + e33*Az - 9.80665f; // +: 上向き
@@ -859,6 +873,15 @@ void logging(void)
       Logdata[LogdataCounter++] = g_alt_u_v;                 // AltPID出力[V]
       Logdata[LogdataCounter++] = g_cmd_duty;                // 目標平均duty(Δ)
       Logdata[LogdataCounter++] = (g_preset_mode ? 1.0f:0.0f);
+
+      Logdata[LogdataCounter++] = ina219_get_vbus_V();        // 51: Vbus_raw [V]
+      Logdata[LogdataCounter++] = ina219_get_vbus_filt_V();   // 52: Vbus_filt [V]
+      Logdata[LogdataCounter++] = ina219_get_comp_factor();   // 53: Vcomp (=Vref/Vfilt)
+      
+      bool w=false,c=false,s=false; ina219_get_flags(&w,&c,&s);
+      Logdata[LogdataCounter++] = w ? 1.0f : 0.0f;          // 54: warn flag
+      Logdata[LogdataCounter++] = c ? 1.0f : 0.0f;          // 55: crit flag
+      Logdata[LogdataCounter++] = s ? 1.0f : 0.0f;          // 56: sag  flag
     }
     else Logflag=2;
   }

@@ -32,6 +32,7 @@ target_link_libraries(pico_copter
   pico_multicore
   hardware_pio
   )
+target_include_directories(pico_copter PRIVATE ${CMAKE_CURRENT_LIST_DIR}/modules)
 
 pico_enable_stdio_usb(pico_copter 1)
 pico_enable_stdio_uart(pico_copter 0)
@@ -54,6 +55,8 @@ target_sources(pico_copter PRIVATE
   #LED
   modules/ws2812/WS2812.cpp
   modules/rgbled/rgbled.cpp
+  #電圧センサー
+  modules/ina219.cpp
   #tofセンサー
   third_party/ST_VL53L1X/VL53L1X_api.c
   third_party/ST_VL53L1X/vl53l1_platform.c

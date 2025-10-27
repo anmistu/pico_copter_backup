@@ -72,6 +72,12 @@ int main(void)
   // Core起動前後どちらでもOK（ISR中はNG）
   tof_setup();
 
+  ina219_setup(i2c1, 0x40);
+
+  // 3S の例（4Sなら 14.8f / warn 14.9f / crit 14.2f などに変更）
+  ina219_set_vref_V(18.5f);               // 名目電圧（Vref）
+  ina219_set_thresholds(18.0f, 17.2f);    // warn / crit しきい値
+  ina219_set_iir_alpha(0.10f);            // IIR平滑（0.05〜0.20 推奨）
 
   Arm_flag=1;
 
