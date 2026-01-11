@@ -20,6 +20,8 @@ extern volatile float g_follow_dy;
 extern volatile float g_follow_depth_m;
 extern volatile uint32_t g_follow_last_us;
 extern volatile bool g_follow_data_valid;
+extern volatile float g_follow_rx_hz;
+
 
 // ===== 追加ヘルパ =====
 // USB CDC 受信バッファを捨てる（ブロック回避）
@@ -78,6 +80,25 @@ static inline void process_usb_command() {
 
     cam_link_touch();
 
+    // === 受信レート(Hz)推定 ===
+    static uint32_t prev_us = 0;
+    uint32_t now_us = time_us_32();
+
+    if (prev_us != 0) {
+        uint32_t dt_us = now_us - prev_us;  // wrapしてもunsigned差分でOK
+        if (dt_us > 0) {
+            float hz = 1e6f / (float)dt_us;
+
+            // 異常値対策（必要なら）
+            if (hz > 500.0f) hz = 500.0f;
+
+            // 簡易LPF（なめらかにする）
+            const float beta = 0.25f;
+            g_follow_rx_hz = (1.0f - beta) * g_follow_rx_hz + beta * hz;
+        }
+    }
+    prev_us = now_us;
+
     // depth(mm)→m の自動判定
     float depth_m = depth_f;
     if (depth_m > 10.0f) depth_m *= 0.001f;
@@ -93,7 +114,7 @@ static inline void process_usb_command() {
     g_follow_dx         = dx_f;
     g_follow_dy         = dy_f;
     g_follow_depth_m    = dm_f;
-    g_follow_last_us    = time_us_32();
+    g_follow_last_us    = now_us;
     g_follow_data_valid = true;
 }
 

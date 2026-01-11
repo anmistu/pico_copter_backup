@@ -114,6 +114,7 @@ extern volatile float     g_follow_depth_m;     // [m]
 extern volatile uint32_t  g_follow_last_us;     // [us] timestamp of last USB update
 extern volatile bool      g_follow_data_valid;  // true if last parse OK
 extern volatile bool      g_follow_enabled;     // CH5 AltHold ON → true, OFF → false
+extern volatile float     g_follow_rx_hz;
 
 
 #endif

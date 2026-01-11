@@ -31,6 +31,7 @@ volatile float     g_follow_depth_m    = 0.0f;
 volatile uint32_t  g_follow_last_us    = 0;
 volatile bool      g_follow_data_valid = false;
 volatile bool      g_follow_enabled    = false;
+volatile float     g_follow_rx_hz      = 0.0f;
 
 static inline float deg2rad(float d){ return d * (float)M_PI / 180.0f; }
 
@@ -45,9 +46,6 @@ static const float FOLLOW_KP_DIST      = FOLLOW_PITCH_MAX / 1.0f;
 // Slew per 100Hz update for pitch [rad] (e.g., 2 deg/update)
 static const float FOLLOW_PITCH_SLEW   = deg2rad(2.0f);
 
-// ★ Roll: dx → ロール角
-static const float FOLLOW_ROLL_MAX     = deg2rad(3.0f);   // roll目標角の上限[rad]
-static const float FOLLOW_ROLL_SLEW    = deg2rad(1.5f);   // roll角の1ステップあたり変化量[rad]
 
 // Yaw: dx full-scale and limits
 static const float FOLLOW_DX_FS_PX     = 320.0f;   // tune to your camera width/2
@@ -117,13 +115,13 @@ uint16_t LogdataCounter=0;
 uint8_t Logflag=0;
 volatile uint8_t Logoutputflag=0;
 float Log_time=0.0;
-const uint8_t DATANUM=66;                 // ★ 66
+const uint8_t DATANUM=23;                 // ★ 66
 const uint32_t LOGDATANUM=48000;
 float Logdata[LOGDATANUM]={0.0f};
 
 // === Preset Fixed-Thrust Mode (CH5) ===
 // 平均推力のみを合わせ、姿勢補正(差分)は保持する
-static const float PRESET_DUTY      = 0.38f;                 // 目標平均duty
+static const float PRESET_DUTY      = 0.40f;                 // 目標平均duty
 static const float PRESET_RAMP_SEC  = 0.30f;                 // ランプ時間[s]
 static const float PRESET_RAMP_STEP = (1.0f/400.0f)/PRESET_RAMP_SEC;
 
@@ -157,7 +155,6 @@ PID theta_pid;
 PID psi_pid;
 PID follow_pos_pid;
 PID follow_yaw_pid;
-PID follow_roll_pid;
 
 void loop_400Hz(void);
 void rate_control(void);
@@ -402,15 +399,10 @@ void control_init(void)
   alt_pid.reset();
 
   // ★ 追従：位置PI（距離[m] → ピッチ角[rad]）
-  follow_pos_pid.set_parameter( 1.3f, 1000.0f ,0.07f ,0.020f ,0.01f);
+  follow_pos_pid.set_parameter( 1.0f, 1000.0f ,0.07f ,0.020f ,0.01f);
   follow_pos_pid.reset();
-
-  // ★ 追従：dx正規化[-1..1] → ロール角[rad]
-  follow_roll_pid.set_parameter( 1.3f, 1000.0f ,0.05f ,0.020f ,0.01f );
-  follow_roll_pid.reset();
-
   // ★ 追従：Yaw位置PI（dx正規化[-1..1] → 角速度[rad/s]）
-  follow_yaw_pid.set_parameter( 1.0f, 1000.0f ,0.05f ,0.020f ,0.01f);
+  follow_yaw_pid.set_parameter( 1.85f, 1000000.0f ,0.05f ,0.020f ,0.01f);
   follow_yaw_pid.reset();
 
 }
@@ -638,11 +630,6 @@ void angle_control(void)
   float q0,q1,q2,q3;
   float e23,e33,e13,e11,e12;
 
-  // 追従：距離→ピッチ角 [rad]
-  static float theta_add = 0.0f;
-  // 追従：dx→ロール角 [rad]
-  static float phi_add   = 0.0f;
-
   while (1)
   {
     // 100 Hz駆動（semはrate_control側から4回に1回ポスト）
@@ -671,7 +658,8 @@ void angle_control(void)
     Theta_ref = Theta_trim + 0.3f*M_PI * (float)(Chdata[1] - (CH2MAX+CH2MIN)*0.5f) * 2.0f/(CH2MAX-CH2MIN);
     Psi_ref   = Psi_trim   + 0.8f*M_PI * (float)(Chdata[0] - (CH1MAX+CH1MIN)*0.5f) * 2.0f/(CH1MAX-CH1MIN);
 
-    // === 追従共有：dx正規化[-1..1] と 前進スケール係数 ===
+    // === 追従共有：dx正規化[-1..1] ===
+    // ★Yawのみ追従（Pitch/Roll追従は無効化）
     const bool follow_on    = g_follow_enabled;
     const bool follow_fresh = g_follow_data_valid &&
                               (time_us_32() - g_follow_last_us <= FOLLOW_TIMEOUT_US);
@@ -685,73 +673,6 @@ void angle_control(void)
       float ex = (FOLLOW_DX_FS_PX > 1e-6f) ? (mag / FOLLOW_DX_FS_PX) : 0.0f; // 0..1
       if (ex > 1.0f) ex = 1.0f;
       follow_ex = ex * sgn;  // -1..1
-    }
-
-    // dxが大きいほど前進(pitch追従)を弱めるスケール
-    float forward_scale = 1.0f;
-    if (follow_on && follow_fresh) {
-      float ex_abs = fabsf(follow_ex);
-      if (ex_abs > 1.0f) ex_abs = 1.0f;
-      // ex_abs=0 → 1.0, ex_abs=1 → 0.0
-      forward_scale = cosf(ex_abs * (float)M_PI * 0.5f);
-    }
-
-    // === 追従：距離→ピッチ角（位置PIのみ）===
-    {
-      if (follow_on && follow_fresh) {
-        // 距離誤差（+：遠い→前進ピッチ）
-        float e_pos = FOLLOW_DISTANCE_M - g_follow_depth_m;
-        if (fabsf(e_pos) < FOLLOW_DEADBAND_M) e_pos = 0.0f;
-
-        // 位置PIの出力を「目標ピッチ角」として使用
-        float theta_target = follow_pos_pid.update(e_pos);
-
-        // 上限（±FOLLOW_PITCH_MAX）＋簡易アンチワインドアップ
-        if (theta_target >  FOLLOW_PITCH_MAX) { theta_target =  FOLLOW_PITCH_MAX; follow_pos_pid.i_reset(); }
-        if (theta_target < -FOLLOW_PITCH_MAX) { theta_target = -FOLLOW_PITCH_MAX; follow_pos_pid.i_reset(); }
-
-        // スルーレート制限（100 Hz）
-        float dth = theta_target - theta_add;
-        if      (dth >  FOLLOW_PITCH_SLEW) theta_add += FOLLOW_PITCH_SLEW;
-        else if (dth < -FOLLOW_PITCH_SLEW) theta_add -= FOLLOW_PITCH_SLEW;
-        else                               theta_add  = theta_target;
-      } else {
-        // 追従OFF/ロスト：なめらかに0へ復帰、積分はリセット
-        if      (theta_add >  FOLLOW_PITCH_SLEW) theta_add -= FOLLOW_PITCH_SLEW;
-        else if (theta_add < -FOLLOW_PITCH_SLEW) theta_add += FOLLOW_PITCH_SLEW;
-        else                                     theta_add  = 0.0f;
-        follow_pos_pid.reset();
-      }
-
-      // yaw/roll誤差が大きいときは前進量を弱める
-      float theta_add_scaled = theta_add * forward_scale;
-      Theta_ref += theta_add_scaled;
-    }
-
-    // === 追従：dx → ロール角 ===
-    {
-      if (follow_on && follow_fresh) {
-        // follow_ex [-1..1] をそのまま入力
-        float phi_target = follow_roll_pid.update(follow_ex);
-
-        // roll角の上限（±FOLLOW_ROLL_MAX）＋簡易アンチワインドアップ
-        if (phi_target >  FOLLOW_ROLL_MAX) { phi_target =  FOLLOW_ROLL_MAX; follow_roll_pid.i_reset(); }
-        if (phi_target < -FOLLOW_ROLL_MAX) { phi_target = -FOLLOW_ROLL_MAX; follow_roll_pid.i_reset(); }
-
-        // スルーレート制限（100 Hz）
-        float dphi = phi_target - phi_add;
-        if      (dphi >  FOLLOW_ROLL_SLEW) phi_add += FOLLOW_ROLL_SLEW;
-        else if (dphi < -FOLLOW_ROLL_SLEW) phi_add -= FOLLOW_ROLL_SLEW;
-        else                               phi_add  = phi_target;
-      } else {
-        // 追従OFF/ロスト：なめらかに0へ復帰、積分はリセット
-        if      (phi_add >  FOLLOW_ROLL_SLEW) phi_add -= FOLLOW_ROLL_SLEW;
-        else if (phi_add < -FOLLOW_ROLL_SLEW) phi_add += FOLLOW_ROLL_SLEW;
-        else                                  phi_add  = 0.0f;
-        follow_roll_pid.reset();
-      }
-
-      Phi_ref += phi_add;
     }
 
     // === 角度偏差 ===
@@ -776,12 +697,9 @@ void angle_control(void)
       Theta_bias = Theta;
       Psi_bias   = Psi;
 
-      // 追従PIDもリセット
-      follow_pos_pid.reset();
-      follow_roll_pid.reset();
+      // 追従PIDもリセット（Yawのみ使用）
       follow_yaw_pid.reset();
-      theta_add = 0.0f;
-      phi_add   = 0.0f;
+      follow_pos_pid.reset();   // ※将来のPitch追従復活に備えて残す（現状未使用）
     }
     else
     {
@@ -795,10 +713,7 @@ void angle_control(void)
 
       if (follow_on && follow_fresh) {
         // follow_ex [-1..1] をそのまま入力
-        float ex = follow_ex;
-
-        // 位置PI → 角速度
-        r_add = follow_yaw_pid.update(ex);
+        r_add = follow_yaw_pid.update(follow_ex);
 
         // 上限（±FOLLOW_YAW_RATE_MAX）＋簡易アンチワインドアップ
         if (r_add >  FOLLOW_YAW_RATE_MAX) { r_add =  FOLLOW_YAW_RATE_MAX; follow_yaw_pid.i_reset(); }
@@ -851,6 +766,9 @@ void angle_control(void)
 }
 
 
+
+
+
 void logging(void)
 {
   // CH5スイッチでログON
@@ -859,61 +777,61 @@ void logging(void)
     if(Logflag==0){ Logflag=1; LogdataCounter=0; }
     if(LogdataCounter+DATANUM<LOGDATANUM)
     {
-      Logdata[LogdataCounter++]=Xe(0,0);                  //  1
-      Logdata[LogdataCounter++]=Xe(1,0);                  //  2
-      Logdata[LogdataCounter++]=Xe(2,0);                  //  3
-      Logdata[LogdataCounter++]=Xe(3,0);                  //  4
-      Logdata[LogdataCounter++]=Xe(4,0);                  //  5
-      Logdata[LogdataCounter++]=Xe(5,0);                  //  6
-      Logdata[LogdataCounter++]=Xe(6,0);                  //  7
+      // Logdata[LogdataCounter++]=Xe(0,0);                  //  1
+      // Logdata[LogdataCounter++]=Xe(1,0);                  //  2
+      // Logdata[LogdataCounter++]=Xe(2,0);                  //  3
+      // Logdata[LogdataCounter++]=Xe(3,0);                  //  4
+      // Logdata[LogdataCounter++]=Xe(4,0);                  //  5
+      // Logdata[LogdataCounter++]=Xe(5,0);                  //  6
+      // Logdata[LogdataCounter++]=Xe(6,0);                  //  7
 
-      Logdata[LogdataCounter++]=Wp;                       //  8
-      Logdata[LogdataCounter++]=Wq;                       //  9
-      Logdata[LogdataCounter++]=Wr;                       // 10
+      // Logdata[LogdataCounter++]=Wp;                       //  8
+      // Logdata[LogdataCounter++]=Wq;                       //  9
+      // Logdata[LogdataCounter++]=Wr;                       // 10
 
-      Logdata[LogdataCounter++]=Ax;                       // 11
-      Logdata[LogdataCounter++]=Ay;                       // 12
-      Logdata[LogdataCounter++]=Az;                       // 13
-      Logdata[LogdataCounter++]=Mx;                       // 14
-      Logdata[LogdataCounter++]=My;                       // 15
-      Logdata[LogdataCounter++]=Mz;                       // 16
+      // Logdata[LogdataCounter++]=Ax;                       // 11
+      // Logdata[LogdataCounter++]=Ay;                       // 12
+      // Logdata[LogdataCounter++]=Az;                       // 13
+      // Logdata[LogdataCounter++]=Mx;                       // 14
+      // Logdata[LogdataCounter++]=My;                       // 15
+      // Logdata[LogdataCounter++]=Mz;                       // 16
 
-      Logdata[LogdataCounter++]=Pref;                     // 17
-      Logdata[LogdataCounter++]=Qref;                     // 18
-      Logdata[LogdataCounter++]=Rref;                     // 19
+      // Logdata[LogdataCounter++]=Pref;                     // 17
+      // Logdata[LogdataCounter++]=Qref;                     // 18
+      // Logdata[LogdataCounter++]=Rref;                     // 19
 
-      Logdata[LogdataCounter++]=Phi-Phi_bias;             // 20 roll現在[rad]
-      Logdata[LogdataCounter++]=Theta-Theta_bias;         // 21 pitch現在[rad]
-      Logdata[LogdataCounter++]=Psi-Psi_bias;             // 22 yaw現在[rad]
+      // Logdata[LogdataCounter++]=Phi-Phi_bias;             // 20 roll現在[rad]
+      // Logdata[LogdataCounter++]=Theta-Theta_bias;         // 21 pitch現在[rad]
+      // Logdata[LogdataCounter++]=Psi-Psi_bias;             // 22 yaw現在[rad]
 
-      Logdata[LogdataCounter++]=Phi_ref;                  // 23 roll目標[rad]
-      Logdata[LogdataCounter++]=Theta_ref;                // 24 pitch目標[rad]
-      Logdata[LogdataCounter++]=Psi_ref;                  // 25 yaw目標[rad]
+      // Logdata[LogdataCounter++]=Phi_ref;                  // 23 roll目標[rad]
+      // Logdata[LogdataCounter++]=Theta_ref;                // 24 pitch目標[rad]
+      // Logdata[LogdataCounter++]=Psi_ref;                  // 25 yaw目標[rad]
 
-      Logdata[LogdataCounter++]=P_com;                    // 26
-      Logdata[LogdataCounter++]=Q_com;                    // 27
-      Logdata[LogdataCounter++]=R_com;                    // 28
+      // Logdata[LogdataCounter++]=P_com;                    // 26
+      // Logdata[LogdataCounter++]=Q_com;                    // 27
+      // Logdata[LogdataCounter++]=R_com;                    // 28
 
-      Logdata[LogdataCounter++]=p_pid.m_integral;         // 29
-      Logdata[LogdataCounter++]=q_pid.m_integral;         // 30
-      Logdata[LogdataCounter++]=r_pid.m_integral;         // 31
-      Logdata[LogdataCounter++]=phi_pid.m_integral;       // 32
-      Logdata[LogdataCounter++]=theta_pid.m_integral;     // 33
+      // Logdata[LogdataCounter++]=p_pid.m_integral;         // 29
+      // Logdata[LogdataCounter++]=q_pid.m_integral;         // 30
+      // Logdata[LogdataCounter++]=r_pid.m_integral;         // 31
+      // Logdata[LogdataCounter++]=phi_pid.m_integral;       // 32
+      // Logdata[LogdataCounter++]=theta_pid.m_integral;     // 33
 
-      Logdata[LogdataCounter++]=Pbias;                    // 34
-      Logdata[LogdataCounter++]=Qbias;                    // 35
-      Logdata[LogdataCounter++]=Rbias;                    // 36
+      // Logdata[LogdataCounter++]=Pbias;                    // 34
+      // Logdata[LogdataCounter++]=Qbias;                    // 35
+      // Logdata[LogdataCounter++]=Rbias;                    // 36
 
-      Logdata[LogdataCounter++]=T_ref;                    // 37
-      Logdata[LogdataCounter++]=Acc_norm;                 // 38
-      Logdata[LogdataCounter++]=(g_preset_mode ? 1.0f : 0.0f); // 39 preset状態
-      Logdata[LogdataCounter++]=g_out_duty;               // 40 平均duty
+      // Logdata[LogdataCounter++]=T_ref;                    // 37
+      // Logdata[LogdataCounter++]=Acc_norm;                 // 38
+      // Logdata[LogdataCounter++]=(g_preset_mode ? 1.0f : 0.0f); // 39 preset状態
+      // Logdata[LogdataCounter++]=g_out_duty;               // 40 平均duty
 
-      // 最終PWM出力
-      Logdata[LogdataCounter++]=g_out_fr;                 // 41
-      Logdata[LogdataCounter++]=g_out_fl;                 // 42
-      Logdata[LogdataCounter++]=g_out_rr;                 // 43
-      Logdata[LogdataCounter++]=g_out_rl;                 // 44
+      // // 最終PWM出力
+      // Logdata[LogdataCounter++]=g_out_fr;                 // 41
+      // Logdata[LogdataCounter++]=g_out_fl;                 // 42
+      // Logdata[LogdataCounter++]=g_out_rr;                 // 43
+      // Logdata[LogdataCounter++]=g_out_rl;                 // 44
 
       // ToF距離[mm]（無効時は -1）
       Logdata[LogdataCounter++]= g_tof_valid ? (float)g_tof_mm : -1.0f; // 45
@@ -986,6 +904,11 @@ void logging(void)
         }
       }
       Logdata[LogdataCounter++] = ex_dx;                   // 66: ex_dx [-1..1]
+
+      // 受信Hz（データがfreshでない時は 0）
+      float rx_hz = follow_fresh ? g_follow_rx_hz : 0.0f;
+      Logdata[LogdataCounter++] = rx_hz;                   // 67: follow_rx_hz [Hz]
+
     }
     else Logflag=2;
   }
