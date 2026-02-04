@@ -36,15 +36,26 @@ volatile float     g_follow_rx_hz      = 0.0f;
 static inline float deg2rad(float d){ return d * (float)M_PI / 180.0f; }
 
 // Target distance [m]
-static const float FOLLOW_DISTANCE_M   = 2.0f;
+static const float FOLLOW_DISTANCE_M   = 3.0f;
 // Distance deadband [m]
-static const float FOLLOW_DEADBAND_M   = 0.05f;
-// Pitch command limit [rad] (e.g., ±8 deg)
+static const float FOLLOW_DEADBAND_M   = 0.30f;
+
+// === Pitch follow (cascaded) tuning knobs ===
+// Inner loop output limit: pitch command added to Theta_ref [rad]
 static const float FOLLOW_PITCH_MAX    = deg2rad(8.0f);
-// Distance → pitch gain [rad/m] (1.0 m error => ~8 deg)
-static const float FOLLOW_KP_DIST      = FOLLOW_PITCH_MAX / 1.0f;
-// Slew per 100Hz update for pitch [rad] (e.g., 2 deg/update)
-static const float FOLLOW_PITCH_SLEW   = deg2rad(2.0f);
+// Slew limit per 100Hz update for pitch command [rad/update]
+static const float FOLLOW_PITCH_SLEW   = deg2rad(4.0f);
+
+// Outer loop output limit: target forward/backward speed [m/s]
+static const float FOLLOW_VREF_MAX     = 0.60f;
+// Slew limit per 100Hz update for v_ref [m/s/update]
+static const float FOLLOW_VREF_SLEW    = 0.05f;
+
+// Velocity estimate LPF coefficient (0..1), higher = quicker but noisier
+static const float FOLLOW_VEL_LPF_BETA = 0.25f;
+
+// Safety clamp for depth step used in velocity estimate [m/update]
+static const float FOLLOW_DDEPTH_CLAMP = 0.20f;
 
 
 // Yaw: dx full-scale and limits
@@ -53,7 +64,7 @@ static const float FOLLOW_DX_DB_PX     = 10.0f;    // deadband
 static const float FOLLOW_YAW_RATE_MAX = deg2rad(80.0f); // [rad/s]
 
 // USB data timeout to disable follow [us]
-static const uint32_t FOLLOW_TIMEOUT_US = 200000;  // 0.2s
+static const uint32_t FOLLOW_TIMEOUT_US = 800000;  // 0.5s
 // === 二重PID 用 ===
 PID   alt_pos_pid;                      // 外側：位置→速度
 float g_z_hat_m   = 0.0f;               // KF推定
@@ -154,6 +165,7 @@ PID phi_pid;
 PID theta_pid;
 PID psi_pid;
 PID follow_pos_pid;
+PID follow_vel_pid;
 PID follow_yaw_pid;
 
 void loop_400Hz(void);
@@ -398,9 +410,17 @@ void control_init(void)
   alt_pid.set_parameter( 1.7f, 1000.0f, 0.050f, 0.020f, 0.10f ); // まずはP主体
   alt_pid.reset();
 
-  // ★ 追従：位置PI（距離[m] → ピッチ角[rad]）
-  follow_pos_pid.set_parameter( 1.0f, 1000.0f ,0.07f ,0.020f ,0.01f);
+  // ★ 追従 Pitch（二重PID）
+  // 外側：距離誤差[m] → 目標前後速度 v_ref [m/s]
+  //  - まずはP主体（I=ほぼ無し）で安定優先
+  follow_pos_pid.set_parameter( 3.6f, 1000.0f ,0.065f ,0.020f ,0.01f);
   follow_pos_pid.reset();
+
+  // 内側：速度誤差[m/s] → ピッチ角コマンド[rad]（Theta_refへ加算）
+  //  - まずはP主体（必要なら後でIを少し追加）
+  follow_vel_pid.set_parameter( 0.0f, 1000000.0f ,0.00f ,0.020f ,0.01f);
+  follow_vel_pid.reset();
+
   // ★ 追従：Yaw位置PI（dx正規化[-1..1] → 角速度[rad/s]）
   follow_yaw_pid.set_parameter( 1.85f, 1000000.0f ,0.05f ,0.020f ,0.01f);
   follow_yaw_pid.reset();
@@ -664,6 +684,90 @@ void angle_control(void)
     const bool follow_fresh = g_follow_data_valid &&
                               (time_us_32() - g_follow_last_us <= FOLLOW_TIMEOUT_US);
 
+    // === Pitch追従（二重PID）：距離 → 速度 → ピッチ角 ===
+    // 外側PID：距離誤差[m] → 目標前後速度 v_ref [m/s]
+    // 内側PID：速度誤差[m/s] → ピッチ角コマンド[rad] を Theta_ref に加算
+    // 追従中のみ有効。途切れたらPIDと状態をリセット。
+    static float follow_pitch_cmd = 0.0f;  // [rad]（slew後の実際に加算する値）
+    static float v_ref_cmd        = 0.0f;  // [m/s]（slew後の目標速度）
+    static float depth_prev_m     = 0.0f;  // [m]   速度推定用
+    static bool  depth_prev_init  = false;
+    static float v_est_filt_mps   = 0.0f;  // [m/s] 速度推定LPF
+
+    // 100Hz想定（control_initで PID の h=0.01f を設定済み）
+    const float dt_follow = 0.01f;
+
+    if (follow_on && follow_fresh) {
+      // --- 距離誤差（target - current）---
+      float e_dist = FOLLOW_DISTANCE_M - g_follow_depth_m;
+
+      // デッドバンド
+      if (fabsf(e_dist) < FOLLOW_DEADBAND_M) {
+        e_dist = 0.0f;
+      } else {
+        e_dist = (e_dist > 0.0f) ? (e_dist - FOLLOW_DEADBAND_M) : (e_dist + FOLLOW_DEADBAND_M);
+      }
+
+      // --- 速度推定 v_est [m/s] （depthの差分）---
+      const float depth_now_m = g_follow_depth_m;
+      if (!depth_prev_init) {
+        depth_prev_m    = depth_now_m;
+        depth_prev_init = true;
+        v_est_filt_mps  = 0.0f;
+      }
+
+      float ddepth = depth_now_m - depth_prev_m;
+      // 異常なジャンプを抑制（受信ノイズ/欠損対策）
+      if (ddepth >  FOLLOW_DDEPTH_CLAMP) ddepth =  FOLLOW_DDEPTH_CLAMP;
+      if (ddepth < -FOLLOW_DDEPTH_CLAMP) ddepth = -FOLLOW_DDEPTH_CLAMP;
+
+      const float v_est_mps = ddepth / dt_follow;
+      // LPF
+      v_est_filt_mps += FOLLOW_VEL_LPF_BETA * (v_est_mps - v_est_filt_mps);
+      depth_prev_m = depth_now_m;
+
+      // --- 外側：距離 → 速度（PID出力 = v_ref_raw）---
+      float v_ref_raw = follow_pos_pid.update(e_dist);
+
+      // v_ref飽和 + 簡易アンチワインドアップ
+      if (v_ref_raw >  FOLLOW_VREF_MAX) { v_ref_raw =  FOLLOW_VREF_MAX; follow_pos_pid.i_reset(); }
+      if (v_ref_raw < -FOLLOW_VREF_MAX) { v_ref_raw = -FOLLOW_VREF_MAX; follow_pos_pid.i_reset(); }
+
+      // v_ref の slew 制限（急加速を抑える）
+      float dv = v_ref_raw - v_ref_cmd;
+      if (dv >  FOLLOW_VREF_SLEW) dv =  FOLLOW_VREF_SLEW;
+      if (dv < -FOLLOW_VREF_SLEW) dv = -FOLLOW_VREF_SLEW;
+      v_ref_cmd += dv;
+
+      // --- 内側：速度 → ピッチ角（PID出力 = theta_raw）---
+      const float e_v = v_ref_cmd - v_est_filt_mps;
+      float theta_raw = follow_vel_pid.update(e_v);
+
+      // pitch飽和 + 簡易アンチワインドアップ
+      if (theta_raw >  FOLLOW_PITCH_MAX) { theta_raw =  FOLLOW_PITCH_MAX; follow_vel_pid.i_reset(); }
+      if (theta_raw < -FOLLOW_PITCH_MAX) { theta_raw = -FOLLOW_PITCH_MAX; follow_vel_pid.i_reset(); }
+
+      // pitch slew制限（急に角度が飛ばないように）
+      float dtheta = theta_raw - follow_pitch_cmd;
+      if (dtheta >  FOLLOW_PITCH_SLEW) dtheta =  FOLLOW_PITCH_SLEW;
+      if (dtheta < -FOLLOW_PITCH_SLEW) dtheta = -FOLLOW_PITCH_SLEW;
+      follow_pitch_cmd += dtheta;
+
+    } else {
+      // データ途切れ / 追従OFF
+      follow_pos_pid.reset();
+      follow_vel_pid.reset();
+      follow_pitch_cmd = 0.0f;
+      v_ref_cmd = 0.0f;
+      v_est_filt_mps = 0.0f;
+      depth_prev_init = false;
+    }
+
+    // ★ここが「Pitch追従を有効化する本体」
+    // もし「前後が逆に動く」なら、符号を反転： Theta_ref -= follow_pitch_cmd;
+    Theta_ref += follow_pitch_cmd;
+
+
     float follow_ex = 0.0f;      // dx正規化 [-1..1]
     if (follow_on && follow_fresh) {
       float dx  = g_follow_dx;
@@ -696,10 +800,14 @@ void angle_control(void)
       Phi_bias   = Phi;
       Theta_bias = Theta;
       Psi_bias   = Psi;
-
-      // 追従PIDもリセット（Yawのみ使用）
+      // 追従PIDもリセット
       follow_yaw_pid.reset();
-      follow_pos_pid.reset();   // ※将来のPitch追従復活に備えて残す（現状未使用）
+      follow_pos_pid.reset();
+      follow_vel_pid.reset();
+      follow_pitch_cmd = 0.0f;
+      v_ref_cmd = 0.0f;
+      v_est_filt_mps = 0.0f;
+      depth_prev_init = false;
     }
     else
     {
